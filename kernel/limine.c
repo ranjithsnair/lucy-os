@@ -348,57 +348,63 @@ limine_early_init(void)
   }
 }
 
-// True iff physical page p falls inside some USABLE range dmap_usable[]
-// snapshotted (dmap_usable's own comment) - dmap_end is only the
-// *highest* such range's end address, not a guarantee everything below
-// it is real backed RAM (there can be large reserved/MMIO gaps in
-// between), so dmap_init_pool() below can't just treat all of
-// [0,dmap_end) as free the way freerange() treats [kernbase_paddr,
-// pool_end) - that range, unlike this one, was already trimmed to a
-// single contiguous USABLE run by limine_early_init() above.
+// A physical range dmap_init_pool() below must skip over when treating
+// memory as free - the main pool, the ramdisk, or (once found) the
+// pageref array's own storage. A fixed, small set of these (at most 3),
+// not a per-page membership test: an earlier version of this file
+// walked every single page in [0,donate_limit) and, for each one,
+// linearly rescanned dmap_usable[] to ask "is this address usable, and
+// not excluded" - the O(pages * entries) cost of that (against a
+// donate_limit up to DMAP_DONATE_CAP below) was the actual, measured
+// multi-second delay between the kernel starting and bootsplash ever
+// getting to draw its first pixel. Donating N pages still costs at
+// least N kfree() calls (each page needs its own freelist-linkage
+// write - there's no way around touching every page once), but the
+// bookkeeping around that is now O(memmap entries), not O(pages).
+struct dmap_excl { uintp base, end; };
+
+// Finds the next maximal free (non-excluded) sub-range at or after *p,
+// within [*p, end) - jumping straight past an exclusion range instead
+// of stepping through it one page at a time. Returns 0 once *p reaches
+// end (nothing free left in this span).
 static int
-dmap_page_usable(uintp p)
+dmap_next_free_run(uintp *p, uintp end, struct dmap_excl *excl, int nexcl, uintp *run_end)
 {
-  for(uint64 i = 0; i < dmap_usable_count; i++){
-    if(p >= dmap_usable[i].base && p + PGSIZE <= dmap_usable[i].end)
-      return 1;
+  int i;
+
+restart:
+  if(*p >= end)
+    return 0;
+  for(i = 0; i < nexcl; i++){
+    if(*p >= excl[i].base && *p < excl[i].end){
+      *p = excl[i].end;
+      goto restart;
+    }
   }
-  return 0;
+  *run_end = end;
+  for(i = 0; i < nexcl; i++)
+    if(excl[i].base > *p && excl[i].base < *run_end)
+      *run_end = excl[i].base;
+  return 1;
 }
 
-// True iff physical page p already belongs to some other, already-
-// managed range - the main pool (kernel/kalloc.c's pageref[], set up by
-// kinit1()/kinit2() before this function ever runs - see its own call
-// site, kernel/main.c) or the ramdisk (kernel/ide.c) - and so must not
-// be handed to kfree() a second time here.
-static int
-dmap_page_excluded(uintp p)
-{
-  if(p >= kernbase_paddr && p < pool_end)
-    return 1;
-  if(p >= ramdisk_paddr && p < ramdisk_paddr + ramdisk_size)
-    return 1;
-  return 0;
-}
-
-// Donates every USABLE physical page in [0,dmap_end) that the main pool
-// and the ramdisk don't already own to kernel/kalloc.c's allocator, via
-// the direct map (dmap_end/DMAP_VBASE, memlayout.h) kernel/vm.c's
-// setupkvm() already installed in kpgdir (and, from here on, every
-// process's pgdir) by the time this runs - see its own call site
-// (kernel/main.c's main(), right after kinit2()) for why it has to be
-// this late: kvmalloc() has to have built that mapping first, and
+// Donates every USABLE physical page in [0,donate_limit) that the main
+// pool and the ramdisk don't already own to kernel/kalloc.c's
+// allocator, via the direct map (dmap_end/DMAP_VBASE, memlayout.h)
+// kernel/vm.c's setupkvm() already installed in kpgdir (and, from here
+// on, every process's pgdir) by the time this runs - see its own call
+// site (kernel/main.c's main(), right after kinit2()) for why it has
+// to be this late: kvmalloc() has to have built that mapping first, and
 // kinit1()/kinit2() have to have already claimed the main pool's own
 // range before this treats anything as free.
 //
 // Needs somewhere to keep a refcount per donated page (kernel/kalloc.c's
 // dmap_pageref[], kdmapreserve()'s own comment explains why that can't
 // just be a second PHYSTOP-sized static array) - so this runs in two
-// passes: first hunting for enough contiguous, USABLE, not-already-
-// owned physical memory to hold that table itself (a linear byte-by-
-// byte scan, not entry-interval math, deliberately: simple and obviously
-// correct beats clever here), then a second pass handing every
-// remaining such page to kfree().
+// passes over dmap_usable[]'s entries: first hunting for enough
+// contiguous, USABLE, not-already-owned physical memory to hold that
+// table itself, then a second pass handing every remaining such page
+// to kfree().
 //
 // Donation is capped well below dmap_end/build_dmap()'s own full
 // mapped range (which stays cheap at any size - see dmap_end's own
@@ -415,29 +421,41 @@ dmap_page_excluded(uintp p)
 // extending past the main pool in the first place) need nowhere near a
 // full multi-GB machine's worth of extra memory - a modest, fixed cap
 // is enough headroom without the eager-touch cost scaling with however
-// much RAM the host happens to have.
-#define DMAP_DONATE_CAP 0x80000000ULL // 2GB
+// much RAM the host happens to have. Even with kdmapfreerange()'s
+// single-lock-for-the-whole-range bulk path (kernel/kalloc.c) replacing
+// a lock-per-page kfree() loop, the remaining per-page freelist-node
+// write is still O(pages donated) - measured at roughly 0.1s for this
+// 512MB cap under QEMU/TCG emulation vs. ~1s at 2GB, and this is on
+// dinit's critical path before bootsplash can draw its first pixel, so
+// smaller wins here even though a real machine has room to spare.
+#define DMAP_DONATE_CAP 0x20000000ULL // 512MB
 void
 dmap_init_pool(void)
 {
   if(dmap_end == 0)
     return;
   uintp donate_limit = dmap_end < DMAP_DONATE_CAP ? dmap_end : DMAP_DONATE_CAP;
-
   uintp pageref_bytes = PGROUNDUP((donate_limit / PGSIZE) * sizeof(ushort));
-  uintp run_start = 0, run_len = 0, pageref_paddr = 0;
 
-  for(uintp p = 0; p < donate_limit; p += PGSIZE){
-    if(dmap_page_excluded(p) || !dmap_page_usable(p)){
-      run_len = 0;
-      continue;
-    }
-    if(run_len == 0)
-      run_start = p;
-    run_len += PGSIZE;
-    if(run_len >= pageref_bytes){
-      pageref_paddr = run_start;
-      break;
+  struct dmap_excl excl[3];
+  excl[0].base = kernbase_paddr;
+  excl[0].end = pool_end;
+  excl[1].base = ramdisk_paddr;
+  excl[1].end = ramdisk_paddr + ramdisk_size;
+
+  uintp pageref_paddr = 0;
+  for(uint64 e = 0; e < dmap_usable_count && pageref_paddr == 0; e++){
+    uintp p = PGROUNDUP(dmap_usable[e].base);
+    uintp entry_end = PGROUNDDOWN(dmap_usable[e].end);
+    if(entry_end > donate_limit)
+      entry_end = donate_limit;
+    uintp run_end;
+    while(dmap_next_free_run(&p, entry_end, excl, 2, &run_end)){
+      if(run_end - p >= pageref_bytes){
+        pageref_paddr = p;
+        break;
+      }
+      p = run_end;
     }
   }
   if(pageref_paddr == 0)
@@ -445,13 +463,18 @@ dmap_init_pool(void)
 
   kdmapreserve(pageref_paddr, donate_limit / PGSIZE);
 
-  for(uintp p = 0; p < donate_limit; p += PGSIZE){
-    if(dmap_page_excluded(p))
-      continue;
-    if(p >= pageref_paddr && p < pageref_paddr + pageref_bytes)
-      continue;
-    if(!dmap_page_usable(p))
-      continue;
-    kfree(DMAP_P2V(p));
+  excl[2].base = pageref_paddr;
+  excl[2].end = pageref_paddr + pageref_bytes;
+
+  for(uint64 e = 0; e < dmap_usable_count; e++){
+    uintp p = PGROUNDUP(dmap_usable[e].base);
+    uintp entry_end = PGROUNDDOWN(dmap_usable[e].end);
+    if(entry_end > donate_limit)
+      entry_end = donate_limit;
+    uintp run_end;
+    while(dmap_next_free_run(&p, entry_end, excl, 3, &run_end)){
+      kdmapfreerange(p, run_end);
+      p = run_end;
+    }
   }
 }

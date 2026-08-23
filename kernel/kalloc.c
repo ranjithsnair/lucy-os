@@ -78,6 +78,51 @@ kdmapreserve(uintp paddr, uintp count)
   memset(dmap_pageref, 0, count * sizeof(ushort));
 }
 
+// Bulk equivalent of calling kfree(DMAP_P2V(p)) once per page across
+// [start,end) (physical, page-aligned) - the only caller is kernel/
+// limine.c's dmap_init_pool(), seeding the direct-map-donated pool at
+// boot. Skips per-page locking and every check a real kfree() needs
+// for a page that could come from anywhere and be freed at any time:
+// this is a one-shot, single-CPU bulk operation, called from a boot
+// window where no other CPU is ever calling kalloc()/kfree()
+// concurrently (userinit() - the first process - hasn't run yet, so
+// every already-started AP is confined to scheduler()'s empty-ptable
+// idle spin, never touching kmem), over pages this kernel has never
+// touched before (dmap_pageref[] is freshly zeroed by kdmapreserve()
+// above, so every slot here already reads 0 - "never allocated" -
+// exactly what kfree() would have computed anyway).
+//
+// One lock acquire/release for the whole range, not one per page -
+// modeled on the same principle ToaruOS's own boot-time frame-
+// allocator init uses (kernel/arch/x86_64/mmu.c's mmu_frame_clear(), a
+// lockless single bit-flip per page, called in an unlocked loop from
+// mmu_init()): poc-os's linked-freelist design still needs one write
+// per page (there's no way around that with this data structure - a
+// bitmap would trade this for smaller/cheaper per-page work but a
+// linear scan on every allocation, a bigger change than this donation
+// path needs), but paying for a lock acquire/release *and* kfree()'s
+// full generality on every single one of those writes measured as
+// several real seconds of boot time once the donated range grew past
+// a few hundred MB - long enough to be the actual "why does the boot
+// logo take so long to appear" complaint, since dinit can't launch
+// bootsplash until this function returns.
+void
+kdmapfreerange(uintp start, uintp end)
+{
+  char *p;
+  struct run *r;
+
+  if(kmem.use_lock)
+    acquire(&kmem.lock);
+  for(p = (char*)DMAP_P2V(start); p < (char*)DMAP_P2V(end); p += PGSIZE){
+    r = (struct run*)p;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
+  if(kmem.use_lock)
+    release(&kmem.lock);
+}
+
 // Return this pa's refcount slot, in whichever of the two tables above
 // actually covers it - the only thing kalloc()/kfree()/kaddref()/
 // kgetref() need to know to treat the main pool and the direct-map-
