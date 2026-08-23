@@ -117,6 +117,38 @@ $ltr:
   ltr ax
   ret
 
+; void reloadseg(ushort cs_sel, ushort ds_sel)
+; Loads ds/es/fs/gs/ss with ds_sel directly (an ordinary mov), and
+; reloads cs with cs_sel via a far return - the only way to change cs
+; in long mode short of a far call/jmp or an interrupt return. Needed
+; right after lgdt() replaces the GDT (seginit(), kernel/vm.c): unlike
+; a real segment-limit-checking mode, the CPU doesn't re-validate cs/ss
+; against whatever GDT is currently loaded just because lgdt ran - it
+; keeps using the *already-cached* descriptor state from whichever
+; selector was active before, which under Limine is a selector from
+; Limine's own (now unloaded) GDT, not this kernel's. That stays
+; invisible for perfectly ordinary code the entire time, since nothing
+; about plain execution re-checks it - until the first iretq, which
+; *does* re-validate cs/ss (a trap return) against the GDT actually
+; loaded now, and #GPs since Limine's old selector value doesn't
+; correspond to a valid descriptor in this kernel's own gdt[]. Found
+; the hard way (a VirtualBox VM), the first interrupt to ever return
+; on the boot cpu after seginit() ran.
+global reloadseg
+reloadseg:
+  mov ax, si
+  mov ds, ax
+  mov es, ax
+  mov fs, ax
+  mov gs, ax
+  mov ss, ax
+  push rdi
+  lea rax, [rel .reloaded]
+  push rax
+  o64 retf
+.reloaded:
+  ret
+
 ; uint readeflags(void)
 global readeflags
 readeflags:

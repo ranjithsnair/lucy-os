@@ -70,6 +70,16 @@ void            ideinit(void);
 void            ideintr(void);
 void            iderw(struct buf*);
 
+// limine.c
+void            limine_early_init(void);
+void            limine_entry_init(void);
+void            dmap_init_pool(void);
+extern uintp    limine_hhdm_offset;
+extern uintp    ramdisk_paddr;
+extern uintp    ramdisk_size;
+extern uintp    pool_end;
+extern uintp    dmap_end;
+
 // ioapic.c
 void            ioapicenable(int irq, int cpu);
 extern uchar    ioapicid;
@@ -78,10 +88,11 @@ void            ioapicinit(void);
 // kalloc.c
 char*           kalloc(void);
 void            kfree(char*);
-void            kinit1(void*, void*);
-void            kinit2(void*, void*);
+void            kinit1(void*, void*, uintp, uintp);
+void            kinit2(void*, void*, uintp, uintp);
 void            kaddref(uintp);
 int             kgetref(uintp);
+void            kdmapreserve(uintp, uintp);
 
 // kbd.c
 void            kbdintr(void);

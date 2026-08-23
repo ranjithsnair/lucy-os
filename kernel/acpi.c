@@ -100,7 +100,7 @@ rsdpsearch1(uint a, int len)
 {
   uchar *p, *e;
 
-  p = P2V(a);
+  p = HW_P2V(a);
   e = p + len;
   for(; p < e; p += 16)
     if(memcmp(p, "RSD PTR ", 8) == 0 && sum(p, 20) == 0)
@@ -119,7 +119,7 @@ rsdpsearch(void)
   uint p;
   struct rsdp *r;
 
-  bda = (uchar*) P2V(0x400);
+  bda = (uchar*) HW_P2V(0x400);
   if((p = ((bda[0x0F]<<8) | bda[0x0E]) << 4)){
     if((r = rsdpsearch1(p, 1024)))
       return r;
@@ -152,7 +152,7 @@ acpiinit(void)
   // 1MB - see kernel/mp.c's mpsearch()), ACPI tables can land anywhere
   // in RAM, including above PHYSTOP - see kmapphys()'s own comment.
   kmapphys(rsdp->rsdtaddress, sizeof(struct sdthdr));
-  rsdt = (struct sdthdr*) P2V((uintp) rsdp->rsdtaddress);
+  rsdt = (struct sdthdr*) HW_P2V((uintp) rsdp->rsdtaddress);
   if(memcmp(rsdt->signature, "RSDT", 4) != 0)
     return;
   kmapphys(rsdp->rsdtaddress, rsdt->length);
@@ -165,7 +165,7 @@ acpiinit(void)
   madt = 0;
   for(i = 0; i < nentries; i++){
     kmapphys(entries[i], sizeof(struct sdthdr));
-    struct sdthdr *t = (struct sdthdr*) P2V((uintp) entries[i]);
+    struct sdthdr *t = (struct sdthdr*) HW_P2V((uintp) entries[i]);
     if(memcmp(t->signature, "APIC", 4) != 0)
       continue;
     kmapphys(entries[i], t->length);

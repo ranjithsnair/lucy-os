@@ -1,5 +1,20 @@
 #define NPROC        64  // maximum number of processes
-#define KSTACKSIZE 4096  // size of per-process kernel stack
+// Raised from 4096 (1 page) for the Limine port: kernel/trapasm.asm's
+// frame-normalization fix (see its own comment) made a same-privilege
+// (kernel-interrupting-kernel) trap return correctly instead of
+// silently corrupting things - which in turn meant a timer tick
+// landing *during* one of execve()'s several readi()/bread() calls now
+// nests a full trap frame onto an already fairly deep kernel call
+// chain, instead of never getting that far. Found the hard way (a
+// VirtualBox VM): 1 page overflowed past the bottom of a process's
+// kernel stack under exactly that nesting, corrupting whatever kalloc()
+// page happened to sit below it - each fix just moved the crash to the
+// next readi()/bread() call site deeper in, confirming it was stack
+// exhaustion, not any one call site. kernel/proc.c's allocproc() uses a
+// dedicated static array for kernel stacks now, not kalloc() (which
+// only ever hands out one PGSIZE page at a time, no way to get several
+// contiguous ones from it), so this can be page-unaligned in size.
+#define KSTACKSIZE 16384
 // USTACKPAGES: usable pages of user stack exec.c allocates (below a
 // single guard page - see its own comment). A dynamically-linked
 // program's real gnulib call chains run far deeper, with far bigger

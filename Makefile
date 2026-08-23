@@ -17,6 +17,7 @@ OBJS = \
 	$(OBJDIR)/kernel/kalloc.o\
 	$(OBJDIR)/kernel/kbd.o\
 	$(OBJDIR)/kernel/lapic.o\
+	$(OBJDIR)/kernel/limine.o\
 	$(OBJDIR)/kernel/log.o\
 	$(OBJDIR)/kernel/main.o\
 	$(OBJDIR)/kernel/mouse.o\
@@ -47,11 +48,7 @@ KERNELLD = kernel/kernel.ld
 INITCODEOBJ = $(OBJDIR)/user/initcode.o
 OBJS += $(SWTCHOBJ) $(TRAPASMOBJ) $(X86ASMOBJ)
 
-# Toolchain: x86_64-elf-gcc/ld (Homebrew, /usr/local/bin) is multilib - it
-# takes -m32 as well as -m64 (see BOOTCFLAGS/CFLAGS below) and its ld
-# supports both the elf_i386 and elf_x86_64 emulations - so this one
-# toolchain builds the 64-bit kernel and the always-32-bit boot
-# sector/AP trampoline alike. No separate i686-elf- toolchain needed.
+# Toolchain: x86_64-elf-gcc/ld (Homebrew, /usr/local/bin).
 TOOLPREFIX = x86_64-elf-
 CC = $(TOOLPREFIX)gcc
 LD = $(TOOLPREFIX)ld
@@ -63,13 +60,11 @@ QEMU = qemu-system-x86_64
 # NASM assembles all the .asm (Intel-syntax) sources. The shared C headers
 # in include/ (constants, struct layouts) are still expanded into them with
 # the C preprocessor before NASM ever sees the file - see the %.o: %.asm
-# rules below. BOOTNASMFLAGS is for the always-32-bit boot sector/AP
-# trampoline; NASMFLAGS is used for every other hand-written .asm source.
+# rule below.
 NASM = nasm
-BOOTNASMFLAGS = -f elf32 -g
 NASMFLAGS = -f elf64 -g
 
-# All headers live in include/, shared by boot/, kernel/, user/ and mkfs/.
+# All headers live in include/, shared by kernel/, user/ and mkfs/.
 CPPFLAGS = -Iinclude
 
 CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -Werror -fno-omit-frame-pointer -Wno-error=array-bounds -Wno-error=infinite-recursion -Wno-error=unused-but-set-variable -m64
@@ -84,16 +79,8 @@ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb 
 CFLAGS += -mgeneral-regs-only
 CFLAGS += -fno-stack-protector -fno-pie -no-pie
 
-# boot/*.c compiles with the fixed-32-bit BOOTNASMFLAGS above, but still
-# wants the same warning/codegen posture as CFLAGS, so BOOTCFLAGS
-# mirrors it rather than reusing CFLAGS directly (whose -m64 doesn't
-# apply here) - including -mgeneral-regs-only, for the same reason:
-# boot code runs in real/protected mode with no SSE state management
-# either.
-BOOTCFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer -Wno-error=array-bounds -Wno-error=infinite-recursion -Wno-error=unused-but-set-variable -mgeneral-regs-only -fno-stack-protector -fno-pie -no-pie
-
-# KCFLAGS adds flags needed only for kernel C code proper (not the boot
-# sector, not user programs): -mcmodel=kernel because KERNBASE
+# KCFLAGS adds flags needed only for kernel C code proper (not user
+# programs): -mcmodel=kernel because KERNBASE
 # (0xFFFFFFFF80000000, see memlayout.h) is in the top -2GB, which is
 # exactly the address range GCC's "kernel" code model - as opposed to
 # the default "small" model, which assumes symbols live in the *low*
@@ -103,38 +90,32 @@ BOOTCFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -g
 # zone.
 KCFLAGS = -mcmodel=kernel -mno-red-zone
 
-# ld's emulation name for each target, hardcoded (confirmed via
-# `x86_64-elf-ld -V` on this machine: elf_x86_64 / elf_i386, not the
-# FreeBSD elf_i386_fbsd variant).
+# ld's emulation name, hardcoded (confirmed via `x86_64-elf-ld -V` on
+# this machine: elf_x86_64, not the FreeBSD elf_i386_fbsd variant).
 LDFLAGS += -m elf_x86_64
-BOOTLDFLAGS += -m elf_i386
 
 # Every generated file lives under build/: final binaries, disk images,
 # and disassembly/symbol dumps directly in build/, and every intermediate
 # .o/.d/.i file under build/obj/, mirroring the source tree
-# (build/obj/kernel/, build/obj/user/, build/obj/boot/). Keeping the
-# object tree at a distinct path from the final binaries matters, not
-# just style: build/kernel (the linked kernel binary) and a hypothetical
-# build/kernel/ (a directory of kernel object files) can't both exist, so
-# intermediates get their own build/obj/ subtree instead of colliding
-# with the very product names they build towards - the same reason
-# kernel/, user/, and boot/ exist as directories one level up in the
-# first place. boot/, kernel/, user/, include/, and mkfs/ contain only
-# hand-written (or, for kernel/vectors.pl's output, generated-but-
-# that's-the-point) source, never build output; `make clean` is just
-# `rm -rf build`.
+# (build/obj/kernel/, build/obj/user/). Keeping the object tree at a
+# distinct path from the final binaries matters, not just style:
+# build/kernel (the linked kernel binary) and a hypothetical build/kernel/
+# (a directory of kernel object files) can't both exist, so intermediates
+# get their own build/obj/ subtree instead of colliding with the very
+# product names they build towards - the same reason kernel/ and user/
+# exist as directories one level up in the first place. kernel/, user/,
+# include/, and mkfs/ contain only hand-written (or, for
+# kernel/vectors.pl's output, generated-but-that's-the-point) source,
+# never build output; `make clean` is just `rm -rf build`.
 BUILD = build
 OBJDIR = $(BUILD)/obj
 
-$(BUILD) $(OBJDIR)/boot $(OBJDIR)/kernel $(OBJDIR)/user $(OBJDIR)/musl-test:
+$(BUILD) $(OBJDIR)/kernel $(OBJDIR)/user $(OBJDIR)/musl-test:
 	mkdir -p $@
 
 # Compile a C source into build/obj/<dir>/<name>.o, keeping the same
-# boot/kernel/user split the sources themselves use. boot/ always uses the
-# fixed-32-bit BOOTCFLAGS; kernel/ adds KCFLAGS on top of CFLAGS.
-$(OBJDIR)/boot/%.o: boot/%.c | $(OBJDIR)/boot
-	$(CC) $(BOOTCFLAGS) $(CPPFLAGS) -c -o $@ $<
-
+# kernel/user split the sources themselves use. kernel/ adds KCFLAGS on
+# top of CFLAGS.
 $(OBJDIR)/kernel/%.o: kernel/%.c | $(OBJDIR)/kernel
 	$(CC) $(CFLAGS) $(KCFLAGS) $(CPPFLAGS) -c -o $@ $<
 
@@ -144,10 +125,6 @@ $(OBJDIR)/user/%.o: user/%.c | $(OBJDIR)/user
 # Assemble a NASM source the same way: first expand #include/#define from
 # include/ with the C preprocessor (cpp doesn't care about NASM vs GAS
 # mnemonics, it just does text substitution), then hand the result to nasm.
-$(OBJDIR)/boot/%.o: boot/%.asm | $(OBJDIR)/boot
-	$(CC) $(CPPFLAGS) -E -x assembler-with-cpp -o $(@:.o=.i) $<
-	$(NASM) $(BOOTNASMFLAGS) -o $@ $(@:.o=.i)
-
 $(OBJDIR)/kernel/%.o: kernel/%.asm | $(OBJDIR)/kernel
 	$(CC) $(CPPFLAGS) -E -x assembler-with-cpp -o $(@:.o=.i) $<
 	$(NASM) $(NASMFLAGS) -o $@ $(@:.o=.i)
@@ -156,180 +133,82 @@ $(OBJDIR)/user/%.o: user/%.asm | $(OBJDIR)/user
 	$(CC) $(CPPFLAGS) -E -x assembler-with-cpp -o $(@:.o=.i) $<
 	$(NASM) $(NASMFLAGS) -o $@ $(@:.o=.i)
 
-$(BUILD)/pocmemfs.img: $(BUILD)/bootblock $(BUILD)/kernelmemfs | $(BUILD)
-	dd if=/dev/zero of=$(BUILD)/pocmemfs.img count=10000
-	dd if=$(BUILD)/bootblock of=$(BUILD)/pocmemfs.img conv=notrunc
-	dd if=$(BUILD)/kernelmemfs of=$(BUILD)/pocmemfs.img seek=1 conv=notrunc
-
-# bootmain.c needs its own rule rather than the generic $(OBJDIR)/boot/%.o
-# pattern above: the boot sector has a hard 510-byte budget (512 minus
-# the 2-byte 0x55AA signature), and -O2 (the default in $(BOOTCFLAGS)) alone
-# generates code too large to fit, so this keeps the lighter -O the
-# original boot Makefile always used here, along with -nostdinc since
-# the boot loader is freestanding.
-$(OBJDIR)/boot/bootmain.o: boot/bootmain.c | $(OBJDIR)/boot
-	$(CC) $(BOOTCFLAGS) $(CPPFLAGS) -fno-pic -O -nostdinc -c -o $@ $<
-
-$(BUILD)/bootblock: $(OBJDIR)/boot/bootasm.o $(OBJDIR)/boot/bootmain.o | $(BUILD)
-	$(LD) $(BOOTLDFLAGS) -N -e start -Ttext 0x7C00 -o $(OBJDIR)/boot/bootblock.o $(OBJDIR)/boot/bootasm.o $(OBJDIR)/boot/bootmain.o
-	$(OBJDUMP) -S $(OBJDIR)/boot/bootblock.o > $(BUILD)/bootblock.dis
-	$(OBJCOPY) -S -O binary -j .text $(OBJDIR)/boot/bootblock.o $(BUILD)/bootblock
-	./boot/sign.pl $(BUILD)/bootblock
-
 # ============================================================
-# BIOS/INT13h boot path: real hardware (legacy IDE, or SATA in
-# AHCI mode via a real BIOS/CSM AHCI driver, or booted from USB),
-# VirtualBox, and QEMU all boot through BIOS/CSM firmware's own
-# INT13h disk services - unlike the original ATA-PIO path (removed;
-# fs.img as a *separate* drive), which only worked when the disk was
-# attached as an emulated/real legacy IDE hard disk. See boot/
-# bootasm_bios.asm's and boot/boot2_bios.asm's own comments for the
-# full reasoning. Everything here - bootloader, kernel, and the
-# whole root filesystem image - lives on one combined disk image
-# (poc_bios.img), since a real USB stick or a real internal disk is
-# one physical device, not two.
+# Limine boot: kernel/kernel.ld's .limine_requests section (kernel/
+# limine.c) is what Limine itself reads to answer requests before ever
+# jumping to kernel/entry.asm - see limine/ (the vendored bootloader
+# itself) and limine.conf (the boot menu entry: kernel path + fs.img as
+# a module). Two image flavors, both BIOS-bootable (no UEFI target -
+# see the QEMUOPTS_BIOS comment below): a raw hard-disk image
+# ($(IMAGE_NAME).hdd, dd-to-USB-bootable) and an ISO
+# ($(IMAGE_NAME).iso) - both built the way limine-bootloader's own
+# example templates do (one small FAT partition holding the kernel ELF,
+# fs.img, and limine.conf, plus `limine bios-install` writing Limine's
+# own MBR/stage-2 bootstrap into the image), and both ultimately hybrid
+# (either can be dd'd raw *or* attached as a CD/DVD), unlike the old
+# BIOS boot loader's split poc_bios.img/poc-os.iso pair.
 # ============================================================
 
-# kernel.bin: a raw, already-relocated flattening of the kernel ELF
-# (same idea as bootblock/boot2/entryother/initcode - objcopy -O
-# binary elsewhere in this Makefile - just applied to the kernel
-# itself here) so boot/boot2_bios.asm never needs to parse an ELF
-# header/program headers in real-mode assembly: the segments are
-# already contiguous (kernel64.ld places .text at EXTMEM with
-# .rodata/.data/.bss immediately following), so "load N bytes
-# starting at physical EXTMEM" is the entire job.
-# -O binary only ever contains *file-backed* content (PT_LOAD's
-# p_filesz, not p_memsz) - it silently drops .bss (p_memsz > p_filesz:
-# kernel/entry64.asm's own boot-time page tables, among other kernel
-# globals, live there, reserved but zero-initialized rather than
-# taking up file space) entirely. boot/boot2_bios.asm has no ELF
-# parser to notice this and zero the gap itself the way boot/
-# boot2main.c's real per-segment stosb() loop does (see its own
-# comment for why this port isn't writing one in real-mode assembly) -
-# so it has to already be zeroed *in the file*, by padding kernel.bin
-# out to the highest PT_LOAD segment's real (PhysAddr+MemSiz) extent,
-# here, once, at build time.
-$(BUILD)/kernel.bin: $(BUILD)/kernel | $(BUILD)
-	$(OBJCOPY) -S -O binary $(BUILD)/kernel $(BUILD)/kernel.bin
-	total=$$($(TOOLPREFIX)readelf -W -l $(BUILD)/kernel | python3 -c '\
-import sys; lines=[l.split() for l in sys.stdin if l.strip().startswith("LOAD")]; \
-paddrs=[int(f[3],16) for f in lines]; ends=[int(f[3],16)+int(f[5],16) for f in lines]; \
-print(max(ends)-min(paddrs))'); \
-	truncate -s $$total $(BUILD)/kernel.bin 2>/dev/null || dd if=/dev/zero bs=1 count=0 seek=$$total of=$(BUILD)/kernel.bin conv=notrunc 2>/dev/null
+IMAGE_NAME = poc-os
+LIMINE_DIR = limine
 
-# bootconfig_bios.h: KERNEL_SECTORS/FS_IMG_LBA/KERNEL_ENTRY are real
-# properties of a specific build (the kernel's actual size and entry
-# point), not constants boot2_bios.asm should hardcode by hand -
-# generated here the same way MUSL_GENH's headers are, and %included
-# by boot2_bios.asm via the usual cpp-then-nasm pipeline (see its own
-# build rule below for the extra -I this needs).
-# BOOT2_BIOS_MAX_SECTORS/BOOT2_BIOS_LBA must match boot/bootasm_bios.asm's
-# own STAGE2_SECTORS - how many sectors stage 1 reads stage 2 into
-# (starting at LBA 1) before jumping to it. Far smaller than the ATA-
-# PIO path's BOOT2_MAX_SECTORS: this stage 2 is hand-written assembly
-# with no ELF-parsing logic at all (see boot/boot2_bios.asm's own
-# comment for why), so it doesn't need nearly as much room.
-BOOT2_BIOS_MAX_SECTORS = 16
-BOOT2_BIOS_LBA = $(shell echo $$((1 + $(BOOT2_BIOS_MAX_SECTORS))))
+# The `limine` deploy-tool binary is a build product of this specific
+# host (portable C source, but not portable machine code), so it's
+# built here rather than committed - unlike everything else under
+# limine/, which is the actual vendored bootloader release (see
+# limine/.gitignore).
+$(LIMINE_DIR)/limine: $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/Makefile
+	$(MAKE) -C $(LIMINE_DIR)
 
-$(OBJDIR)/boot/bootconfig_bios.h: $(BUILD)/kernel.bin $(BUILD)/kernel | $(OBJDIR)/boot
-	kbytes=$$(stat -f%z $(BUILD)/kernel.bin 2>/dev/null || stat -c%s $(BUILD)/kernel.bin); \
-	ksectors=$$(( (kbytes + 511) / 512 )); \
-	kentry=$$($(OBJDUMP) -f $(BUILD)/kernel | sed -n 's/^start address //p'); \
-	{ \
-		echo "#define KERNEL_LBA $(BOOT2_BIOS_LBA)"; \
-		echo "#define KERNEL_SECTORS $$ksectors"; \
-		echo "#define FS_IMG_LBA (KERNEL_LBA + KERNEL_SECTORS)"; \
-		echo "#define KERNEL_ENTRY $$kentry"; \
-	} > $(OBJDIR)/boot/bootconfig_bios.h
+# The raw disk image: a plain-MBR-partitioned (tools/mkmbr.py - not
+# GPT: that's really an EFI-oriented convention, and this is a
+# BIOS-only target, see limine.conf's own comment), FAT-formatted image
+# `limine bios-install` can boot via legacy BIOS - Limine's own stage 2
+# lives in the MBR gap (the unused sectors between the MBR itself and
+# the partition, same spot GRUB's does), same as real hardware/USB-stick
+# booting has worked this whole project via since boot/bootasm_bios.asm
+# (removed). mtools (mformat/mmd/mcopy) is a Homebrew package on this
+# machine, not part of the base toolchain the rest of this Makefile needs.
+$(BUILD)/$(IMAGE_NAME).hdd: $(LIMINE_DIR)/limine $(BUILD)/kernel $(BUILD)/fs.img limine.conf tools/mkmbr.py | $(BUILD)
+	rm -f $(BUILD)/$(IMAGE_NAME).hdd
+	dd if=/dev/zero bs=1M count=64 of=$(BUILD)/$(IMAGE_NAME).hdd
+	python3 tools/mkmbr.py $(BUILD)/$(IMAGE_NAME).hdd 2048 129024
+	./$(LIMINE_DIR)/limine bios-install $(BUILD)/$(IMAGE_NAME).hdd
+	mformat -i $(BUILD)/$(IMAGE_NAME).hdd@@1M
+	mmd -i $(BUILD)/$(IMAGE_NAME).hdd@@1M ::/boot ::/boot/limine
+	mcopy -i $(BUILD)/$(IMAGE_NAME).hdd@@1M $(BUILD)/kernel ::/boot/kernel
+	mcopy -i $(BUILD)/$(IMAGE_NAME).hdd@@1M $(BUILD)/fs.img ::/boot/fs.img
+	mcopy -i $(BUILD)/$(IMAGE_NAME).hdd@@1M limine.conf ::/boot/limine/limine.conf
+	mcopy -i $(BUILD)/$(IMAGE_NAME).hdd@@1M $(LIMINE_DIR)/limine-bios.sys ::/boot/limine/limine-bios.sys
 
-$(BUILD)/bootblock_bios: $(OBJDIR)/boot/bootasm_bios.o | $(BUILD)
-	$(LD) $(BOOTLDFLAGS) -N -e start -Ttext 0x7C00 -o $(OBJDIR)/boot/bootblock_bios.o $(OBJDIR)/boot/bootasm_bios.o
-	$(OBJDUMP) -S $(OBJDIR)/boot/bootblock_bios.o > $(BUILD)/bootblock_bios.dis
-	$(OBJCOPY) -S -O binary -j .text $(OBJDIR)/boot/bootblock_bios.o $(BUILD)/bootblock_bios
-	./boot/sign.pl $(BUILD)/bootblock_bios
-
-# boot2_bios.asm needs bootconfig_bios.h visible on its own include
-# path - the one file in boot/ that does, hence its own rule rather
-# than the generic $(OBJDIR)/boot/%.o: boot/%.asm pattern.
-$(OBJDIR)/boot/boot2_bios.o: boot/boot2_bios.asm $(OBJDIR)/boot/bootconfig_bios.h | $(OBJDIR)/boot
-	$(CC) $(CPPFLAGS) -I$(OBJDIR)/boot -E -x assembler-with-cpp -o $(OBJDIR)/boot/boot2_bios.i boot/boot2_bios.asm
-	$(NASM) $(BOOTNASMFLAGS) -o $@ $(OBJDIR)/boot/boot2_bios.i
-
-# -Ttext 0x1000, not 0x10000 like the ATA-PIO path's boot2 - see boot/
-# bootasm_bios.asm's own comment on STAGE2_ADDR for why (16-bit ELF
-# relocations can't represent an address >= 0x10000).
-$(BUILD)/boot2_bios: $(OBJDIR)/boot/boot2_bios.o | $(BUILD)
-	$(LD) $(BOOTLDFLAGS) -N -e entry2 -Ttext 0x1000 -o $(OBJDIR)/boot/boot2_bios_full.o $(OBJDIR)/boot/boot2_bios.o
-	$(OBJDUMP) -S $(OBJDIR)/boot/boot2_bios_full.o > $(BUILD)/boot2_bios.dis
-	$(OBJCOPY) -S -O binary -j .text -j .rodata -j .data $(OBJDIR)/boot/boot2_bios_full.o $(BUILD)/boot2_bios
-	size=$$(stat -f%z $(BUILD)/boot2_bios 2>/dev/null || stat -c%s $(BUILD)/boot2_bios); \
-	max=$$(( $(BOOT2_BIOS_MAX_SECTORS) * 512 )); \
-	if [ "$$size" -gt "$$max" ]; then \
-		echo "boot2_bios too large: $$size bytes (max $$max, $(BOOT2_BIOS_MAX_SECTORS) sectors)" >&2; \
-		exit 1; \
-	fi
-
-# poc_bios.img layout: sector 0 = bootblock_bios (stage 1), sectors
-# 1..BOOT2_BIOS_MAX_SECTORS = boot2_bios (stage 2), sector KERNEL_LBA
-# (BOOT2_BIOS_LBA, bootconfig_bios.h) onward = kernel.bin, then
-# immediately following (FS_IMG_LBA = KERNEL_LBA + KERNEL_SECTORS) =
-# fs.img - one combined disk image, unlike poc.img+fs.img's two
-# separate drives, since real boot media (a USB stick, an internal
-# disk) is one physical device.
-$(BUILD)/poc_bios.img: $(BUILD)/bootblock_bios $(BUILD)/boot2_bios $(BUILD)/kernel.bin $(BUILD)/fs.img $(OBJDIR)/boot/bootconfig_bios.h | $(BUILD)
-	dd if=/dev/zero of=$(BUILD)/poc_bios.img count=22000
-	dd if=$(BUILD)/bootblock_bios of=$(BUILD)/poc_bios.img conv=notrunc
-	dd if=$(BUILD)/boot2_bios of=$(BUILD)/poc_bios.img seek=1 conv=notrunc
-	dd if=$(BUILD)/kernel.bin of=$(BUILD)/poc_bios.img seek=$(BOOT2_BIOS_LBA) conv=notrunc
-	fsimglba=$$(sed -n 's/^#define KERNEL_SECTORS //p' $(OBJDIR)/boot/bootconfig_bios.h | awk '{print $$1+$(BOOT2_BIOS_LBA)}'); \
-	dd if=$(BUILD)/fs.img of=$(BUILD)/poc_bios.img seek=$$fsimglba conv=notrunc
-
-# One ISO, bootable identically on real hardware (Legacy/CSM BIOS on),
-# VirtualBox, and QEMU when attached as an optical drive (-cdrom, or a
-# virtual/emulated CD/DVD drive) - see boot/bootasm_bios.asm's own
-# comment for why that embedded image reads via CHS, not LBA
-# extensions: found the hard way that El-Torito "hard disk emulation"
-# CD-boot - the mechanism that lets a plain BIOS bootloader address an
-# El-Torito-mounted ISO at all - fails INT13h-extensions-present
-# outright on real BIOS/QEMU/SeaBIOS alike, while CHS is the one
-# interface universal across real disks, USB, and El-Torito emulation.
-# -hard-disk-boot tells xorriso to register the whole image as a "hard
-# disk emulation" El Torito boot entry (not "no emulation", which
-# handed back the CD's native drive - passed the extensions check but
-# then hung on the actual extended read; a QEMU/SeaBIOS
-# ATAPI-sector-size quirk, near as can be told) - boot-load-size is
-# irrelevant in that mode (BIOS always loads exactly the one MBR
-# sector, like any real hard disk boot) but xorriso still wants a
-# value.
-#
-# NOT isohybrid: no isohybrid MBR patching is done here, so this ISO's
-# own LBA 0 is plain ISO9660 (zeroed boot area), not poc_bios.img's
-# MBR/bootblock - dd'ing poc-os.iso straight to a USB stick and
-# booting it as a raw disk will NOT work (confirmed: real hardware
-# selected the drive from the boot menu but hung on a black screen -
-# BIOS was executing the zeroed sector, not bootblock_bios). To make a
-# bootable USB stick, dd $(BUILD)/poc_bios.img (or dist/poc_bios.img)
-# itself, not the .iso - see the `dist` target below.
-$(BUILD)/poc-os.iso: $(BUILD)/poc_bios.img | $(BUILD)
+# The ISO: El-Torito-bootable (limine-bios-cd.bin), then also `limine
+# bios-install`'d so the same .iso is raw-dd-to-USB-bootable too (unlike
+# the old BIOS boot loader's own .iso, which explicitly wasn't - see the
+# BOOT2_BIOS/poc_bios.img git history for that old comment).
+$(BUILD)/$(IMAGE_NAME).iso: $(LIMINE_DIR)/limine $(BUILD)/kernel $(BUILD)/fs.img limine.conf | $(BUILD)
 	rm -rf $(BUILD)/isoroot
-	mkdir -p $(BUILD)/isoroot
-	cp $(BUILD)/poc_bios.img $(BUILD)/isoroot/boot.img
-	xorriso -as mkisofs -o $(BUILD)/poc-os.iso -V POCOS \
-		-b boot.img -hard-disk-boot -boot-load-size 1 $(BUILD)/isoroot
+	mkdir -p $(BUILD)/isoroot/boot/limine
+	cp $(BUILD)/kernel $(BUILD)/isoroot/boot/kernel
+	cp $(BUILD)/fs.img $(BUILD)/isoroot/boot/fs.img
+	cp limine.conf $(BUILD)/isoroot/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(BUILD)/isoroot/boot/limine/
+	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+		-no-emul-boot -boot-load-size 4 -boot-info-table \
+		$(BUILD)/isoroot -o $(BUILD)/$(IMAGE_NAME).iso
+	./$(LIMINE_DIR)/limine bios-install $(BUILD)/$(IMAGE_NAME).iso
+
 
 # entryother and initcode are raw binary blobs the kernel embeds with
 # -b binary (see kernel/main.c's and kernel/proc.c's matching
 # _binary_build_..._start symbols) rather than programs run standalone,
 # so unlike everything else in $(OBJS)/ULIB they need their own two-step
 # ld+objcopy recipe instead of just landing in a link line. They're
-# final build products, not intermediates, so - like bootblock, kernel,
-# and mkfs - they live directly in build/, not build/obj/. entryother
-# is linked on its own below (like kernel/entry.asm, it mixes 16/32/64-
-# bit code in one file - see its own comment - so it needs the regular
-# 64-bit LDFLAGS, just at its own fixed -Ttext 0x7000 rather than
-# KERNLINK); initcode is $(INITCODEOBJ), which links with LDFLAGS like
-# everything else in $(OBJS).
+# final build products, not intermediates, so - like kernel and mkfs -
+# they live directly in build/, not build/obj/. entryother is linked on
+# its own below (it mixes 16/32/64-bit code in one file - see its own
+# comment - so it needs the regular 64-bit LDFLAGS, just at its own
+# fixed -Ttext 0x7000 rather than KERNLINK); initcode is $(INITCODEOBJ),
+# which links with LDFLAGS like everything else in $(OBJS).
 $(BUILD)/entryother: $(OBJDIR)/kernel/entryother.o | $(BUILD)
 	$(LD) $(LDFLAGS) -N -e start -Ttext 0x7000 -o $(OBJDIR)/kernel/bootblockother.o $(OBJDIR)/kernel/entryother.o
 	$(OBJCOPY) -S -O binary -j .text $(OBJDIR)/kernel/bootblockother.o $(BUILD)/entryother
@@ -345,20 +224,8 @@ $(BUILD)/kernel: $(OBJS) $(ENTRYOBJ) $(BUILD)/entryother $(BUILD)/initcode $(KER
 	$(OBJDUMP) -S $(BUILD)/kernel > $(BUILD)/kernel.dis
 	$(OBJDUMP) -t $(BUILD)/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $(BUILD)/kernel.sym
 
-# kernelmemfs is a copy of kernel that maintains the
-# disk image in memory instead of writing to a disk.
-# This is not so useful for testing persistent storage or
-# exploring disk buffering implementations, but it is
-# great for testing the kernel on real hardware without
-# needing a scratch disk.
-MEMFSOBJS = $(filter-out $(OBJDIR)/kernel/ide.o,$(OBJS)) $(OBJDIR)/kernel/memide.o
-$(BUILD)/kernelmemfs: $(MEMFSOBJS) $(ENTRYOBJ) $(BUILD)/entryother $(BUILD)/initcode $(KERNELLD) $(BUILD)/fs.img | $(BUILD)
-	$(LD) $(LDFLAGS) -T $(KERNELLD) -o $(BUILD)/kernelmemfs $(ENTRYOBJ) $(MEMFSOBJS) -b binary $(BUILD)/initcode $(BUILD)/entryother $(BUILD)/fs.img
-	$(OBJDUMP) -S $(BUILD)/kernelmemfs > $(BUILD)/kernelmemfs.dis
-	$(OBJDUMP) -t $(BUILD)/kernelmemfs | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $(BUILD)/kernelmemfs.sym
-
 tags:
-	etags boot/*.asm boot/*.c kernel/*.asm kernel/*.c user/*.c user/*.asm include/*.h mkfs/*.c
+	etags kernel/*.asm kernel/*.c user/*.c user/*.asm include/*.h mkfs/*.c
 
 # Generated (not hand-written), so it lives under build/ like every other
 # build product, even though NASM will treat it as a source file. Needs
@@ -439,8 +306,8 @@ MUSL_CFLAGS = -std=c99 -ffreestanding -nostdinc -D_XOPEN_SOURCE=700 -Os \
 MUSL_INC = -Imusl/arch/x86_64 -Imusl/arch/generic -I$(OBJDIR)/musl/internal \
 	-Imusl/src/include -Imusl/src/internal -I$(OBJDIR)/musl/include -Imusl/include
 
-# One rule for musl/**.c, however deep - unlike boot/kernel/user's
-# fixed one-level split, musl's source tree has real subdirectories
+# One rule for musl/**.c, however deep - unlike kernel/user's fixed
+# one-level split, musl's source tree has real subdirectories
 # (src/env/, src/thread/x86_64/, crt/, ...), so this mirrors each
 # source's path under $(OBJDIR)/musl/ via $(dir $@) rather than
 # pre-declaring every subdirectory as an order-only prerequisite the
@@ -1949,7 +1816,7 @@ $(BUILD)/mkfs: mkfs/mkfs.c include/fs.h | $(BUILD)
 # that disk image changes after first build are persistent until clean.  More
 # details:
 # http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
-.PRECIOUS: $(OBJDIR)/user/%.o $(OBJDIR)/kernel/%.o $(OBJDIR)/boot/%.o $(OBJDIR)/musl/%.o $(OBJDIR)/musl-test/%.o $(OBJDIR)/musl-pic/%.o $(OBJDIR)/coreutils-pic/%.o $(OBJDIR)/bash-pic/%.o $(OBJDIR)/curses-pic/%.o $(OBJDIR)/nano-pic/%.o
+.PRECIOUS: $(OBJDIR)/user/%.o $(OBJDIR)/kernel/%.o $(OBJDIR)/musl/%.o $(OBJDIR)/musl-test/%.o $(OBJDIR)/musl-pic/%.o $(OBJDIR)/coreutils-pic/%.o $(OBJDIR)/bash-pic/%.o $(OBJDIR)/curses-pic/%.o $(OBJDIR)/nano-pic/%.o
 
 # UPROGS is mkfs/mkfs.c's usual root-placed/underscore-stripped
 # convention (a bare host path, e.g. build/_foo -> installed as /foo -
@@ -2070,20 +1937,21 @@ MKFS_INSTALL_DEPS += gui/assets/fonts/DejaVuSans.ttf gui/assets/fonts/DejaVuSans
 $(BUILD)/fs.img: $(BUILD)/mkfs $(UPROGS) $(MKFS_INSTALL_DEPS)
 	./$(BUILD)/mkfs $(BUILD)/fs.img $(UPROGS) $(MKFS_INSTALL)
 
--include $(OBJDIR)/boot/*.d $(OBJDIR)/kernel/*.d $(OBJDIR)/user/*.d $(OBJDIR)/bash-pic/*.d $(OBJDIR)/bash-pic/poc/*.d $(OBJDIR)/bash-pic/poc/builtins/*.d $(OBJDIR)/bash-pic/builtins/*.d $(OBJDIR)/bash-pic/lib/sh/*.d $(OBJDIR)/bash-pic/lib/glob/*.d $(OBJDIR)/bash-pic/lib/tilde/*.d $(OBJDIR)/curses-pic/*.d $(OBJDIR)/nano-pic/*.d $(OBJDIR)/nano-pic/poc/*.d $(OBJDIR)/nano-pic/src/*.d $(OBJDIR)/nano-pic/lib/*.d $(OBJDIR)/nano-pic/lib/malloc/*.d
+-include $(OBJDIR)/kernel/*.d $(OBJDIR)/user/*.d $(OBJDIR)/bash-pic/*.d $(OBJDIR)/bash-pic/poc/*.d $(OBJDIR)/bash-pic/poc/builtins/*.d $(OBJDIR)/bash-pic/builtins/*.d $(OBJDIR)/bash-pic/lib/sh/*.d $(OBJDIR)/bash-pic/lib/glob/*.d $(OBJDIR)/bash-pic/lib/tilde/*.d $(OBJDIR)/curses-pic/*.d $(OBJDIR)/nano-pic/*.d $(OBJDIR)/nano-pic/poc/*.d $(OBJDIR)/nano-pic/src/*.d $(OBJDIR)/nano-pic/lib/*.d $(OBJDIR)/nano-pic/lib/malloc/*.d
 
-all: $(BUILD)/poc_bios.img
+all: $(BUILD)/$(IMAGE_NAME).hdd
 
-# dist/poc_bios.img is the one to dd to a USB stick for a real,
-# legacy-BIOS-bootable pendrive (see poc-os.iso's own comment above
-# for why the .iso itself won't work dd'd raw); dist/poc-os.iso is for
-# burning to optical media or attaching as a virtual/emulated CD/DVD
-# drive (QEMU -cdrom, VirtualBox).
+# dist/poc-os.hdd is the one to dd to a USB stick for a real,
+# legacy-BIOS-bootable pendrive; dist/poc-os.iso is for burning to
+# optical media or attaching as a virtual/emulated CD/DVD drive (QEMU
+# -cdrom, VirtualBox) - though since `limine bios-install` makes it
+# hybrid too (see its own build rule's comment), either file actually
+# works either way.
 DISTDIR = dist
-dist: $(BUILD)/poc_bios.img $(BUILD)/poc-os.iso
+dist: $(BUILD)/$(IMAGE_NAME).hdd $(BUILD)/$(IMAGE_NAME).iso
 	mkdir -p $(DISTDIR)
-	cp $(BUILD)/poc_bios.img $(DISTDIR)/poc_bios.img
-	cp $(BUILD)/poc-os.iso $(DISTDIR)/poc-os.iso
+	cp $(BUILD)/$(IMAGE_NAME).hdd $(DISTDIR)/$(IMAGE_NAME).hdd
+	cp $(BUILD)/$(IMAGE_NAME).iso $(DISTDIR)/$(IMAGE_NAME).iso
 
 run: all
 	$(QEMU) $(QEMUOPTS_BIOS) </dev/null >/dev/null 2>&1 &
@@ -2102,19 +1970,14 @@ ifndef CPUS
 CPUS := 2
 endif
 
-# poc_bios.img (boot/bootasm_bios.asm+boot2_bios.asm, BIOS/INT13h) is
-# one combined disk image - fs.img is already embedded in it (see its
-# own build rule's comment), so this needs only one -drive. This is the
-# image the VBE linear-framebuffer driver (boot2_bios.asm's setup_vbe,
-# kernel/vbe.c) actually lives in - the original ATA-PIO boot path
-# (bootasm.asm) switched to protected mode in its very first boot
-# sector, with no real-mode window left for VBE's BIOS calls at all,
-# and was removed once this BIOS/INT13h path proved it boots
-# identically under QEMU/VirtualBox's BIOS emulation, not just real
-# hardware - see the pocmemfs.img rule above for the one other thing
-# (bootasm.asm/bootmain.c/bootblock) still shared with that removed
-# path.
-QEMUOPTS_BIOS = -drive file=$(BUILD)/poc_bios.img,index=0,media=disk,format=raw -smp $(CPUS) -m 4G $(QEMUEXTRA)
+# $(IMAGE_NAME).hdd is one combined disk image - fs.img is already
+# embedded in it as a Limine module (see its own build rule's comment),
+# so this needs only one -drive. No -bios OVMF.fd/UEFI anywhere here:
+# QEMU's default machine type boots via SeaBIOS (legacy BIOS/CSM),
+# matching this image's own BIOS-only Limine install (limine bios-install,
+# not a UEFI one) - see limine.conf's own comment for the BIOS-vs-UEFI
+# scope decision.
+QEMUOPTS_BIOS = -drive file=$(BUILD)/$(IMAGE_NAME).hdd,index=0,media=disk,format=raw -smp $(CPUS) -m 4G $(QEMUEXTRA)
 
 # `run` launches QEMU detached from this shell's stdio (</dev/null so
 # it can't be suspended by SIGTTIN when backgrounded, output silenced)
@@ -2122,23 +1985,20 @@ QEMUOPTS_BIOS = -drive file=$(BUILD)/poc_bios.img,index=0,media=disk,format=raw 
 # immediately, instead of blocking until QEMU exits the way `qemu`
 # below does. Serial console and monitor fall back to virtual-console
 # tabs inside that window (Ctrl-Alt-2/3).
-qemu: $(BUILD)/poc_bios.img
+qemu: $(BUILD)/$(IMAGE_NAME).hdd
 	$(QEMU) -serial mon:stdio $(QEMUOPTS_BIOS)
 
-qemu-memfs: $(BUILD)/pocmemfs.img
-	$(QEMU) -drive file=$(BUILD)/pocmemfs.img,index=0,media=disk,format=raw -smp $(CPUS) -m 256
-
-qemu-nox: $(BUILD)/poc_bios.img
+qemu-nox: $(BUILD)/$(IMAGE_NAME).hdd
 	$(QEMU) -nographic $(QEMUOPTS_BIOS)
 
 .gdbinit: .gdbinit.tmpl
 	sed "s/localhost:1234/localhost:$(GDBPORT)/" < $^ > $@
 
-qemu-gdb: $(BUILD)/poc_bios.img .gdbinit
+qemu-gdb: $(BUILD)/$(IMAGE_NAME).hdd .gdbinit
 	@echo "*** Now run 'gdb'." 1>&2
 	$(QEMU) -serial mon:stdio $(QEMUOPTS_BIOS) -S $(QEMUGDB)
 
-qemu-nox-gdb: $(BUILD)/poc_bios.img .gdbinit
+qemu-nox-gdb: $(BUILD)/$(IMAGE_NAME).hdd .gdbinit
 	@echo "*** Now run 'gdb'." 1>&2
 	$(QEMU) -nographic $(QEMUOPTS_BIOS) -S $(QEMUGDB)
 

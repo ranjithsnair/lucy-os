@@ -20,6 +20,12 @@
 static void consputc(int);
 
 static int panicked = 0;
+// Which cpu set panicked, by LAPIC ID (not cpuid()/mycpu() - those
+// require interrupts already disabled on the caller's own cpu, which
+// consputc() below can't assume: a *different* cpu's ordinary cprintf()
+// can land there with interrupts still enabled, before it's had any
+// reason of its own to cli()) - see consputc()'s own comment.
+static int panickedlapicid = -1;
 
 static struct {
   struct spinlock lock;
@@ -128,6 +134,17 @@ panic(char *s)
 
   cli();
   cons.locking = 0;
+  // Set before any cprintf() below, not after: consputc()'s own
+  // panicked check is what makes another cpu already mid-print freeze
+  // instead of interleaving with this one - found the hard way (a
+  // multi-cpu VirtualBox boot where two cpus both panicked within the
+  // same instant, each still holding cons.locking=0 and neither having
+  // set panicked yet, garbling the console into interleaved bytes from
+  // both cpus' cprintf() calls, letters and all). panickedlapicid
+  // records which cpu got here first, so consputc() below freezes
+  // every OTHER cpu but still lets this one finish its own message.
+  panickedlapicid = lapicid();
+  panicked = 1; // freeze other CPU
   // use lapiccpunum so that we can call panic from mycpu()
   cprintf("lapicid %d: panic: ", lapicid());
   cprintf(s);
@@ -135,7 +152,6 @@ panic(char *s)
   getcallerpcs(&s, pcs);
   for(i=0; i<10; i++)
     cprintf(" %p", pcs[i]);
-  panicked = 1; // freeze other CPU
   for(;;)
     ;
 }
@@ -143,7 +159,7 @@ panic(char *s)
 //PAGEBREAK: 50
 #define BACKSPACE 0x100
 #define CRTPORT 0x3d4
-static ushort *crt = (ushort*)P2V(0xb8000);  // CGA memory
+static ushort *crt = (ushort*)HW_P2V(0xb8000);  // CGA memory
 
 // Current CGA text attribute byte (high byte of each crt[] cell) -
 // mutated by the SGR handling in consolewrite() below (ESC[0m/ESC[7m),
@@ -322,7 +338,7 @@ conshandlecsi(int final, int *params, int nparams)
 void
 consputc(int c)
 {
-  if(panicked){
+  if(panicked && lapicid() != panickedlapicid){
     cli();
     for(;;)
       ;

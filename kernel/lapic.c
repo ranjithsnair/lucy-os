@@ -141,7 +141,7 @@ lapicstartap(uchar apicid, uint addr)
   // the AP startup code prior to the [universal startup algorithm]."
   outb(CMOS_PORT, 0xF);  // offset 0xF is shutdown code
   outb(CMOS_PORT+1, 0x0A);
-  wrv = (ushort*)P2V((0x40<<4 | 0x67));  // Warm reset vector
+  wrv = (ushort*)HW_P2V((0x40<<4 | 0x67));  // Warm reset vector
   wrv[0] = 0;
   wrv[1] = addr >> 4;
 

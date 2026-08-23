@@ -35,6 +35,13 @@ seginit(void)
   c->gdt[SEG_UCODE] = SEGL(STA_X|STA_R, DPL_USER);
   c->gdt[SEG_UDATA] = SEG(STA_W, 0, 0xffffffff, DPL_USER);
   lgdt(c->gdt, sizeof(c->gdt));
+  // cs/ss aren't re-validated against the GDT just because a new one
+  // was loaded - explicitly reload both to this table's own SEG_KCODE/
+  // SEG_KDATA now, or they silently keep referencing whatever selector
+  // was active before (Limine's own GDT, on the boot cpu) until the
+  // first trap return #GPs trying to restore it - see reloadseg()'s
+  // own comment (kernel/x86.asm).
+  reloadseg(SEG_KCODE<<3, SEG_KDATA<<3);
 }
 
 // Enables FPU/SSE instructions on this CPU - run once per CPU (see
@@ -261,12 +268,29 @@ static struct kmap {
   int perm;
 } kmap[] = {
  { (void*)KERNBASE, 0,             EXTMEM,    PTE_W}, // I/O space
- { (void*)KERNLINK, V2P(KERNLINK), V2P(data), 0},     // kern text+rodata
- { (void*)data,     V2P(data),     PHYSTOP,   PTE_W}, // kern data+memory
+ // kmap[1]/kmap[2]'s phys_start/phys_end can no longer be filled in
+ // here: V2P() (memlayout.h) depends on kernbase_paddr, a value only
+ // known at boot time (Limine picks it, unlike the old, removed BIOS
+ // boot loader's fixed EXTMEM), so it isn't a compile-time constant a
+ // static initializer can use any more - kvmalloc() below patches
+ // these two entries' physical bounds in before the first setupkvm()
+ // call ever reads them.
+ { (void*)KERNLINK, 0, 0, 0},     // kern text+rodata
+ { (void*)data,     0, 0, PTE_W}, // kern data+memory
  // "up to the top of 32-bit physical address space" - uintp doesn't
  // wrap at 32 bits, so this end has to be written out explicitly
  // rather than relying on a phys_end=0/wraparound trick.
  { (void*)DEVSPACE, DEVSPACE,      0x100000000, PTE_W}, // more devices
+ // ramdisk - phys_start/phys_end patched from ramdisk_paddr/
+ // ramdisk_size below, the same way kmap[1]/kmap[2] are patched from
+ // kernbase_paddr (neither is known at compile time - Limine picks
+ // both). RAMDISK_VBASE (memlayout.h), not HW_P2V(ramdisk_paddr): see
+ // its own comment for why that wraps for a module Limine places
+ // above 2GB physical, and this entry - like every other kmap[] one,
+ // unlike the old, boot-time-only kmapphys() call this replaces - is
+ // installed in *every* process's page table, not just whichever one
+ // happened to be active when ideinit() ran.
+ { (void*)RAMDISK_VBASE, 0, 0, PTE_W},
 };
 
 // Map [va, va+size) in a *user* process's own page table directly to
@@ -281,6 +305,38 @@ int
 mapuvm_phys(pde_t *pgdir, uintp va, uintp size, uintp pa, int perm)
 {
   return mappages(pgdir, (void*)va, size, pa, perm);
+}
+
+// The direct map's own PML4 entry (DMAP_VBASE's own comment,
+// memlayout.h), cached after the first pgdir ever builds it - 0 (an
+// impossible value for a present PTE, PTE_P is bit 0) means "not built
+// yet". Every later setupkvm() call just copies this one 8-byte entry
+// instead of re-walking/re-allocating PDPT/PD pages, which is what
+// keeps a fork()-heavy workload from re-paying the direct map's cost
+// on every single process.
+static pde_t dmap_pml4e = 0;
+
+// Install the direct map (dmap_end/DMAP_VBASE, memlayout.h) into pgdir:
+// build it for real the first time this is ever called (from whichever
+// pgdir happens to be first - kvmalloc() below makes that kpgdir), then
+// just copy the cached PML4 entry into every pgdir after that. pa starts
+// at 0 and va starts at DMAP_VBASE, both already 2MB-aligned (DMAP_VBASE
+// sits on a PML4-slot boundary, far coarser than 2MB), and PGROUNDUP2M
+// keeps the size a 2MB multiple too - so mappages()'s fast PS-bit path
+// covers the whole range with just PDPT+PD pages, never any 4KB PTEs
+// (see mappages()'s and dmap_end's own comments for why that mattered).
+static void
+ensure_dmap(pde_t *pgdir)
+{
+  if(dmap_pml4e){
+    pgdir[PML4X(DMAP_VBASE)] = dmap_pml4e;
+    return;
+  }
+  if(dmap_end == 0)
+    return; // limine_early_init() found no usable memory - nothing to map
+  if(mappages(pgdir, (void*)DMAP_VBASE, PGROUNDUP2M(dmap_end), 0, PTE_W) < 0)
+    panic("ensure_dmap: out of memory");
+  dmap_pml4e = pgdir[PML4X(DMAP_VBASE)];
 }
 
 // Set up kernel part of a page table.
@@ -304,6 +360,7 @@ setupkvm(void)
       freevm(pgdir);
       return 0;
     }
+  ensure_dmap(pgdir);
   return pgdir;
 }
 
@@ -412,27 +469,27 @@ deallocuvm(pde_t *pgdir, uintp oldsz, uintp newsz)
       pa = PTE_ADDR(*pte);
       if(pa == 0)
         panic("kfree");
-      // pa >= PHYSTOP means this PTE was never a kalloc()'d page in
-      // the first place - the framebuffer's real physical VRAM,
-      // mapped in by kernel/sysproc.c's sys_mmap() FRAMEBUFFER path
-      // (kernel/vm.c's mapuvm_phys()), is the one thing that lands
-      // here today. kfree() itself panics on any address >= PHYSTOP
-      // (kernel/kalloc.c) - calling it on device memory that was never
-      // part of the free pool would either corrupt that pool or hit
-      // that exact panic the moment any process holding such a
-      // mapping exits/execs/shrinks. Just drop the mapping; there is
-      // nothing to return to the allocator.
+      // !ISPOOLPA(pa) (memlayout.h) means this PTE was never a
+      // kalloc()'d page in the first place - the framebuffer's real
+      // physical VRAM, mapped in by kernel/sysproc.c's sys_mmap()
+      // FRAMEBUFFER path (kernel/vm.c's mapuvm_phys()), is the one
+      // thing that lands here today. kfree() itself panics on any
+      // address outside the pool (kernel/kalloc.c) - calling it on
+      // device memory that was never part of the free pool would
+      // either corrupt that pool or hit that exact panic the moment
+      // any process holding such a mapping exits/execs/shrinks. Just
+      // drop the mapping; there is nothing to return to the allocator.
       //
       // PTE_SHM (include/mmu.h) is the same idea for a different
       // reason: kernel/shm.c's shared-memory pages *are* ordinary
-      // kalloc()'d RAM (always < PHYSTOP), but - unlike every other
+      // kalloc()'d RAM (always ISPOOLPA()), but - unlike every other
       // anonymous page reaching this loop - may still be mapped into a
       // second process's page table too. Freeing one process's mapping
       // here would yank memory out from under whoever else has it
       // mapped; the actual free happens once, in shmclose(), only
       // after the shm object's own struct file ref count (shared
       // across every fd/process referencing it) reaches zero.
-      if(pa < PHYSTOP && !(*pte & PTE_SHM)){
+      if(ISPOOLPA(pa) && !(*pte & PTE_SHM)){
         char *v = P2V(pa);
         kfree(v);
       }
@@ -443,33 +500,38 @@ deallocuvm(pde_t *pgdir, uintp oldsz, uintp newsz)
 }
 
 
-// Make sure [pa, pa+size) is readable/writable at its own P2V(pa)
+// Make sure [pa, pa+size) is readable/writable at its own HW_P2V(pa)
 // virtual address in kpgdir, leaving any page that's already mapped
 // there alone (unlike mappages(), which panics on a remap - callers
 // like kernel/acpi.c's table walk map the same table's address twice,
 // once by a conservative guess and once by its real length once
-// that's known, and the two can overlap).
+// that's known, and the two can overlap). HW_P2V, not P2V: pa here is
+// some arbitrary physical address unrelated to kernbase_paddr (ACPI
+// tables are placed by firmware whether or not there's even a kernel
+// mapped nearby; kernel/ide.c's ramdisk_paddr is a Limine module,
+// independently placed from this kernel's own image too) - see
+// memlayout.h's own comment on HW_P2V/V2P vs the kernbase_paddr-
+// relative pair for why these need the fixed-KERNBASE-offset one.
 //
 // Needed because kmap[]'s "kern data+memory" entry (see kmap[] above)
-// only identity-maps physical memory up to PHYSTOP: real hardware and
-// QEMU alike are free to place ACPI's tables anywhere in RAM, and on a
-// large-enough -m size that can land above PHYSTOP even though
-// PHYSTOP itself is an artificial cap this kernel imposes, not a
-// description of how much RAM actually exists (see PHYSTOP's own
-// comment in memlayout.h).
+// only identity-maps the managed pool, [kernbase_paddr,
+// kernbase_paddr+PHYSTOP): real hardware and QEMU alike are free to
+// place ACPI's tables anywhere in RAM, and Limine is free to place a
+// module (kernel/ide.c's ramdisk_paddr) anywhere too - neither is
+// guaranteed to land inside that pool window.
 void
 kmapphys(uintp pa, uintp size)
 {
   char *a, *last;
   pte_t *pte;
 
-  a = (char*)PGROUNDDOWN((uintp)P2V(pa));
-  last = (char*)PGROUNDDOWN((uintp)P2V(pa) + size - 1);
+  a = (char*)PGROUNDDOWN((uintp)HW_P2V(pa));
+  last = (char*)PGROUNDDOWN((uintp)HW_P2V(pa) + size - 1);
   for(;; a += PGSIZE){
     if((pte = walkpgdir(kpgdir, a, 1)) == 0)
       panic("kmapphys: out of memory");
     if(!(*pte & PTE_P))
-      *pte = V2P(a) | PTE_W | PTE_P;
+      *pte = HW_V2P(a) | PTE_W | PTE_P;
     if(a == last)
       break;
   }
@@ -480,6 +542,16 @@ kmapphys(uintp pa, uintp size)
 void
 kvmalloc(void)
 {
+  // See kmap[]'s own comment: these two entries' physical bounds need
+  // kernbase_paddr, not known until runtime, so they're patched in
+  // here rather than in kmap[]'s own static initializer.
+  kmap[1].phys_start = V2P(KERNLINK);
+  kmap[1].phys_end   = V2P(data);
+  kmap[2].phys_start = V2P(data);
+  kmap[2].phys_end   = pool_end;
+  kmap[4].phys_start = ramdisk_paddr;
+  kmap[4].phys_end   = ramdisk_paddr + ramdisk_size;
+
   kpgdir = setupkvm();
   switchkvm();
 }
@@ -650,25 +722,23 @@ copyuvm(pde_t *pgdir, uintp sz)
     pa = PTE_ADDR(*pte);
     // Device memory (the framebuffer's real VRAM, mapped by
     // kernel/sysproc.c's sys_mmap() FRAMEBUFFER branch - always
-    // pa >= PHYSTOP, the same test deallocuvm() below already uses to
-    // recognize "not ordinary kalloc()'d RAM, don't kfree() it") is
-    // shared with the child directly, by mapping the same physical
-    // page again, rather than copied: real mmap()'d device memory
-    // stays shared across fork() on a real OS (the child sees the
-    // same live VRAM, not a frozen snapshot from fork() time), and
-    // copying it here isn't just semantically wrong but was
+    // !ISPOOLPA(pa) (memlayout.h), the same test deallocuvm() below
+    // already uses to recognize "not ordinary kalloc()'d RAM, don't
+    // kfree() it") is shared with the child directly, by mapping the
+    // same physical page again, rather than copied: real mmap()'d
+    // device memory stays shared across fork() on a real OS (the child
+    // sees the same live VRAM, not a frozen snapshot from fork() time),
+    // and copying it here isn't just semantically wrong but was
     // impossible outright - P2V(pa) (include/memlayout.h) for a VRAM
-    // address this high (e.g. a real BIOS/QEMU VBE framebuffer at
-    // 0xfd000000) silently wraps around 64-bit arithmetic
-    // (KERNBASE=0xFFFFFFFF80000000 + 0xfd000000 overflows to
-    // 0x7d000000, not a valid kernel address), producing a bogus
-    // source pointer for the memmove() below and panicking the
+    // address like this (e.g. a real BIOS/QEMU VBE framebuffer at
+    // 0xfd000000) is nowhere near kernbase_paddr, so the result is a
+    // bogus source pointer for the memmove() below and panics the
     // kernel on the very next fork() any process with the framebuffer
     // mapped ever made - found via a real GDB backtrace (no prior
     // test program had ever both mmap()'d the framebuffer and called
     // fork(), so this was never exercised before GUI roadmap phase 7
     // (libguitest.c) did both).
-    if(pa >= PHYSTOP){
+    if(!ISPOOLPA(pa)){
       if(mappages(d, (void*)i, PGSIZE, pa, PTE_FLAGS(*pte)) < 0)
         goto bad;
       continue;

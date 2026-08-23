@@ -27,25 +27,113 @@ struct {
   struct run *freelist;
 } kmem;
 
-// Per-physical-page reference count, indexed by pa/PGSIZE - the basis
-// for copy-on-write fork (kernel/vm.c's copyuvm()/vm_handle_pagefault()).
-// BSS-zeroed at boot: every entry starts at 0, which kfree() below
-// treats as "never kalloc()'d before" (the boot-time freerange() case)
-// rather than a real reference dropping to a negative count. Sized to
-// cover every physical page below PHYSTOP - the only range kalloc()
-// ever hands out (device memory like the real framebuffer, always
-// >= PHYSTOP, is mapped directly and never touches this table - see
-// kernel/vm.c's copyuvm() pa>=PHYSTOP branch).
+// Per-physical-page reference count, indexed by (pa-kernbase_paddr)/
+// PGSIZE - the basis for copy-on-write fork (kernel/vm.c's copyuvm()/
+// vm_handle_pagefault()). BSS-zeroed at boot: every entry starts at 0,
+// which kfree() below treats as "never kalloc()'d before" (the
+// boot-time freerange() case) rather than a real reference dropping to
+// a negative count. Sized to cover every physical page in the managed
+// pool, [kernbase_paddr, kernbase_paddr+PHYSTOP) - memlayout.h's own
+// comment on kernbase_paddr explains why the pool floats there instead
+// of a fixed, compile-time-known 0 - the only range kalloc() ever hands
+// out (device memory like the real framebuffer is mapped directly and
+// never touches this table - see memlayout.h's ISPOOLPA()).
+//
+// This is the *main* pool's own refcount table only, not the direct
+// map's (dmap_pageref below) - two separate tables, not one sized to
+// cover all of dmap_end, because dmap_end is a runtime-discovered value
+// that can be many GB on a real machine: a single compile-time array
+// sized to its worst case (dmap_end's own 64GB safety cap) would cost
+// up to 32MB of kernel .bss on *every* machine regardless of how much
+// RAM it actually has. See kdmapreserve()'s own comment for how the
+// dmap table avoids that instead.
 static ushort pageref[PHYSTOP / PGSIZE];
 
-// Guarded by kmem.lock (already held across every kalloc()/kfree() call
-// below) rather than a second lock - refcounts only ever change from
-// inside kalloc()/kfree()/kaddref(), so one lock covering all three is
-// enough and avoids any lock-ordering question between two locks.
-static uint
-pageidx(uintp pa)
+// The direct map's own per-page reference count (pageref[]'s
+// counterpart for pages kernel/limine.c's dmap_init_pool() donates to
+// this allocator beyond the main pool above) - NULL/0 until
+// kdmapreserve() runs, which dmap_init_pool() calls exactly once, after
+// finding real, USABLE, not-already-spoken-for physical memory to carve
+// this table's own backing storage out of. Indexed directly by
+// pa/PGSIZE (not offset from any base): the direct map identity-offsets
+// from physical 0 (DMAP_VBASE's own comment, memlayout.h), so every
+// physical page below dmap_pageref_count*PGSIZE has exactly one slot
+// here regardless of where it actually sits in the (possibly
+// discontiguous - Limine's memmap can have gaps) real memory map.
+static ushort *dmap_pageref;
+static uintp dmap_pageref_count;
+
+// Called once by kernel/limine.c's dmap_init_pool(), which - unlike
+// this file - actually knows where real, USABLE physical memory is
+// (Limine's memmap, entry by entry): paddr/count is wherever it found
+// enough contiguous room to hold this table, outside the main pool and
+// the ramdisk. Zeroed here, not left to BSS zero-init like pageref[]
+// above, because this storage is ordinary donated RAM discovered at
+// runtime, not part of this kernel's own static image.
+void
+kdmapreserve(uintp paddr, uintp count)
 {
-  return (uint)(pa / PGSIZE);
+  dmap_pageref = (ushort*)DMAP_P2V(paddr);
+  dmap_pageref_count = count;
+  memset(dmap_pageref, 0, count * sizeof(ushort));
+}
+
+// Return this pa's refcount slot, in whichever of the two tables above
+// actually covers it - the only thing kalloc()/kfree()/kaddref()/
+// kgetref() need to know to treat the main pool and the direct-map-
+// donated pool as one seamless allocator despite their separate
+// bookkeeping. Guarded by kmem.lock (already held across every call
+// site below) rather than a second lock - refcounts only ever change
+// from inside those four functions, so one lock covering all of them is
+// enough and avoids any lock-ordering question between two locks.
+static ushort *
+pagerefslot(uintp pa)
+{
+  if(pa >= kernbase_paddr && pa < pool_end)
+    return &pageref[(pa - kernbase_paddr) / PGSIZE];
+  if(dmap_pageref != 0 && pa < dmap_pageref_count * (uintp)PGSIZE)
+    return &dmap_pageref[pa / PGSIZE];
+  panic("pagerefslot");
+}
+
+// Translate a kernel virtual pointer - either KERNBASE-based (the main
+// pool, kalloc.c's oldest address space) or DMAP_VBASE-based (kernel/
+// limine.c's dmap_init_pool()-donated pages) - to the physical address
+// pagerefslot() above needs. The two ranges are numerically unrelated
+// (DMAP_VBASE < KERNBASE - see memlayout.h) so plain V2P() would
+// silently compute garbage for a DMAP pointer; ISDMAPVA() (memlayout.h)
+// is what tells the two apart.
+static uintp
+kva2pa(char *v)
+{
+  if(ISDMAPVA(v))
+    return DMAP_V2P(v);
+  return V2P(v);
+}
+
+// freerange(), minus whatever part of [vstart,vend) falls inside
+// [xpstart,xpstart+xpsize) (physical addresses) - used by kinit1()/
+// kinit2() below to keep from ever handing out the ramdisk's own pages
+// (kernel/ide.c's ramdisk_paddr/ramdisk_size, discovered at boot by
+// kernel/limine.c's limine_early_init() rather than fixed at a known
+// compile-time offset the way the old BIOS boot loader's RAMDISK_PADDR
+// was - so unlike that fixed constant, this can land anywhere Limine
+// chose to put fs.img, including possibly splitting the middle out of
+// either kinit1()'s or kinit2()'s own range).
+static void
+freerange_except(void *vstart, void *vend, uintp xpstart, uintp xpsize)
+{
+  uintp s = V2P(vstart), e = V2P(vend);
+  uintp xs = xpstart, xe = xpstart + xpsize;
+
+  if(xe <= s || xs >= e){
+    freerange(vstart, vend);
+    return;
+  }
+  if(xs > s)
+    freerange(vstart, P2V(xs));
+  if(xe < e)
+    freerange(P2V(xe), vend);
 }
 
 // Initialization happens in two phases.
@@ -55,17 +143,17 @@ pageidx(uintp pa)
 // 2. main() calls kinit2() with the rest of the physical pages
 // after installing a full page table that maps them on all cores.
 void
-kinit1(void *vstart, void *vend)
+kinit1(void *vstart, void *vend, uintp ramdisk_paddr, uintp ramdisk_size)
 {
   initlock(&kmem.lock, "kmem");
   kmem.use_lock = 0;
-  freerange(vstart, vend);
+  freerange_except(vstart, vend, ramdisk_paddr, ramdisk_size);
 }
 
 void
-kinit2(void *vstart, void *vend)
+kinit2(void *vstart, void *vend, uintp ramdisk_paddr, uintp ramdisk_size)
 {
-  freerange(vstart, vend);
+  freerange_except(vstart, vend, ramdisk_paddr, ramdisk_size);
   kmem.use_lock = 1;
 }
 
@@ -87,29 +175,43 @@ freerange(void *vstart, void *vend)
 // page mapped into more than one process's page table, each with its
 // own kfree() call as it exits/execs/shrinks (kernel/vm.c's
 // deallocuvm()) - so this only actually returns the page to the
-// freelist once every such caller has dropped its share. A pageref[]
-// entry that's still 0 means this exact page has never been through
-// kalloc() since boot (freerange()'s own initial seeding of the free
-// list, kinit1()/kinit2() below) - free it unconditionally, the same
-// as before refcounting existed, rather than underflowing a count that
-// was never incremented in the first place.
+// freelist once every such caller has dropped its share. A refcount
+// slot that's still 0 means this exact page has never been through
+// kalloc() since boot (freerange()'s/dmap_init_pool()'s own initial
+// seeding of the free list) - free it unconditionally, the same as
+// before refcounting existed, rather than underflowing a count that was
+// never incremented in the first place.
+//
+// v can be either a main-pool (KERNBASE-based) or direct-map
+// (DMAP_VBASE-based) pointer - kva2pa() tells them apart. The `v < end`
+// bound only makes sense for the former (a DMAP pointer is numerically
+// far below `end`, an address near KERNBASE), hence the separate branch.
 void
 kfree(char *v)
 {
   struct run *r;
-  uint idx;
+  ushort *slot;
   int dofree;
+  uintp pa;
 
-  if((uintp)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+  if((uintp)v % PGSIZE)
     panic("kfree");
-
-  idx = pageidx(V2P(v));
+  if(ISDMAPVA(v)){
+    pa = DMAP_V2P(v);
+    if(pa >= dmap_end)
+      panic("kfree");
+  } else {
+    if(v < end || V2P(v) >= pool_end)
+      panic("kfree");
+    pa = V2P(v);
+  }
+  slot = pagerefslot(pa);
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
-  if(pageref[idx] == 0)
+  if(*slot == 0)
     dofree = 1;
-  else if(--pageref[idx] == 0)
+  else if(--*slot == 0)
     dofree = 1;
   else
     dofree = 0;
@@ -134,7 +236,7 @@ kaddref(uintp pa)
 {
   if(kmem.use_lock)
     acquire(&kmem.lock);
-  pageref[pageidx(pa)]++;
+  (*pagerefslot(pa))++;
   if(kmem.use_lock)
     release(&kmem.lock);
 }
@@ -149,7 +251,7 @@ kgetref(uintp pa)
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
-  n = pageref[pageidx(pa)];
+  n = *pagerefslot(pa);
   if(kmem.use_lock)
     release(&kmem.lock);
   return n;
@@ -171,8 +273,10 @@ kalloc(void)
     // A freshly-handed-out page always starts single-owner, regardless
     // of what it was last used for (kfree() only ever leaves a page on
     // the freelist once its refcount already reached 0) - set, not
-    // increment.
-    pageref[pageidx(V2P(r))] = 1;
+    // increment. r can be either a main-pool or direct-map pointer
+    // (kfree() pushes both kinds onto the same freelist) - kva2pa()
+    // tells them apart the same way kfree() does.
+    *pagerefslot(kva2pa((char*)r)) = 1;
   }
   if(kmem.use_lock)
     release(&kmem.lock);

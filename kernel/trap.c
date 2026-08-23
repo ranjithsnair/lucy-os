@@ -127,6 +127,10 @@ trap(struct trapframe *tf)
       // that would ever expect one.
       cprintf("unexpected trap %d from cpu %d eip %p (cr2=0x%p)\n",
               (int)tf->trapno, cpuid(), (uintp)tf->eip, (uintp)rcr2());
+      cprintf("err=0x%p esp=0x%p pid=%d name=%s\n",
+              (uintp)tf->err, (uintp)tf->esp,
+              myproc() ? myproc()->pid : -1,
+              myproc() ? myproc()->name : "?");
       panic("trap");
     }
     // vm_handle_pagefault() (kernel/vm.c) resolves a copy-on-write

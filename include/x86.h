@@ -19,6 +19,7 @@ struct gatedesc;
 void lidt(struct gatedesc *p, int size);
 
 void ltr(ushort sel);
+void reloadseg(ushort cs_sel, ushort ds_sel);
 uint readeflags(void);
 void loadgs(ushort v);
 void cli(void);

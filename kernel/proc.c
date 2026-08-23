@@ -23,6 +23,15 @@ struct {
   struct proc proc[NPROC];
 } ptable;
 
+// One dedicated kernel stack per process-table slot, indexed by
+// p-ptable.proc (allocproc() below) rather than kalloc()'d - see
+// param.h's own comment on KSTACKSIZE for why: kalloc() only ever
+// hands out one PGSIZE (4096-byte) page at a time, with no guarantee
+// that two separate calls return contiguous (or even nearby) pages, so
+// it can't back a >1-page stack safely. This lives in the kernel's own
+// .bss instead, sidestepping that entirely.
+static uchar kstacks[NPROC][KSTACKSIZE] __attribute__((aligned(16)));
+
 static struct proc *initproc;
 
 int nextpid = 1;
@@ -102,18 +111,15 @@ found:
 
   release(&ptable.lock);
 
-  // Allocate kernel stack.
-  if((p->kstack = kalloc()) == 0){
-    p->state = UNUSED;
-    return 0;
-  }
+  // Kernel stack: this slot's own dedicated static array entry (see
+  // kstacks's own comment above), not kalloc().
+  p->kstack = (char*)kstacks[p - ptable.proc];
   sp = p->kstack + KSTACKSIZE;
 
   // FXSAVE/FXRSTOR area (see include/proc.h's own comment) - a whole
   // page for the required 16-byte alignment, seeded with a known-clean
   // state (kernel/vm.c's fpuinit()) rather than left zeroed.
   if((p->fpu_state = (uchar*)kalloc()) == 0){
-    kfree(p->kstack);
     p->kstack = 0;
     p->state = UNUSED;
     return 0;
@@ -233,7 +239,6 @@ fork(void)
 
   // Copy process state from proc.
   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
-    kfree(np->kstack);
     np->kstack = 0;
     kfree((char*)np->fpu_state);
     np->fpu_state = 0;
@@ -301,8 +306,12 @@ exit(void)
   struct proc *p;
   int fd;
 
-  if(curproc == initproc)
+  if(curproc == initproc){
+    cprintf("init exiting: name=%s pid=%d rdi=%d eip=0x%p\n",
+            curproc->name, curproc->pid, (int)curproc->tf->rdi,
+            (uintp)curproc->tf->eip);
     panic("init exiting");
+  }
 
   // Close all open files.
   for(fd = 0; fd < NOFILE; fd++){
@@ -357,7 +366,6 @@ wait(void)
       if(p->state == ZOMBIE){
         // Found one.
         pid = p->pid;
-        kfree(p->kstack);
         p->kstack = 0;
         kfree((char*)p->fpu_state);
         p->fpu_state = 0;

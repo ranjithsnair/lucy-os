@@ -10,24 +10,20 @@
 // cover *some* of real hardware/VirtualBox/QEMU, not all of them
 // uniformly).
 //
-// Instead, the boot loader (boot/bootmain.c on the QEMU/VirtualBox-as-
-// IDE-disk path; boot/boot2.asm on the real-hardware/AHCI/USB-boot
-// path - see that file's own comment) loads the *entire* root
-// filesystem image (fs.img, RAMDISK_SIZE bytes - see memlayout.h) into
-// RAM at a fixed physical address, RAMDISK_PADDR, before the kernel
-// ever starts running - using whichever disk-reading mechanism that
-// specific boot path has (real ATA PIO, or BIOS INT13h extended reads,
-// which is itself really just calling out to *firmware's own* disk
-// driver, already written and already correct for whatever controller
-// a given machine actually has). Once the kernel is running, it never
-// touches disk hardware again: every iderw() call below is just a
-// memmove() to/from that already-loaded RAM image. Writes (mkdir, rm,
-// mv, ...) modify the RAM copy only - like any live-boot/initrd-style
-// system, changes don't persist across a reboot unless something
-// explicitly writes the RAM image back out, which nothing here does.
+// Instead, Limine loads the *entire* root filesystem image (fs.img) as
+// a boot module (limine.conf's module_path, kernel/limine.c's
+// limine_early_init() - which sets ramdisk_paddr/ramdisk_size below)
+// into RAM before the kernel ever starts running, using whichever
+// disk-reading mechanism its own BIOS/UEFI boot stage has. Once the
+// kernel is running, it never touches disk hardware again: every
+// iderw() call below is just a memmove() to/from that already-loaded
+// RAM image. Writes (mkdir, rm, mv, ...) modify the RAM copy only -
+// like any live-boot/initrd-style system, changes don't persist across
+// a reboot unless something explicitly writes the RAM image back out,
+// which nothing here does.
 //
-// ideinit()/ideintr() are kept as no-op stubs, not removed outright,
-// so kernel/main.c and kernel/trap.c don't need call-site changes.
+// ideintr() is kept as a no-op stub, not removed outright, so
+// kernel/trap.c doesn't need a call-site change.
 
 #include "types.h"
 #include "defs.h"
@@ -42,14 +38,32 @@
 #include "fs.h"
 #include "buf.h"
 
-_Static_assert(RAMDISK_SIZE == FSSIZE * BSIZE,
-               "RAMDISK_SIZE (memlayout.h) must match FSSIZE*BSIZE (param.h/fs.h) - "
-               "the boot loader and mkfs both size fs.img by the latter.");
+uintp ramdisk_paddr;
+uintp ramdisk_size;
 
 void
 ideinit(void)
 {
-  // Nothing to initialize - no real disk controller involved.
+  // ramdisk_paddr/ramdisk_size (kernel/limine.c's limine_early_init(),
+  // called from main() well before this) must already be set - checked
+  // here, not there, since FSSIZE (param.h/fs.h) isn't limine.c's
+  // concern. A mismatch means limine.conf's module and mkfs/mkfs.c's
+  // fs.img have drifted apart - a real build-time bug, not something to
+  // limp past.
+  if(ramdisk_size != (uintp)FSSIZE * BSIZE)
+    panic("ideinit: ramdisk module size doesn't match FSSIZE*BSIZE - "
+          "limine.conf's fs.img module and mkfs disagree");
+
+  // No kmapphys() call needed here any more: kernel/vm.c's kmap[] has
+  // its own dedicated ramdisk entry now, at the fixed RAMDISK_VBASE
+  // (memlayout.h) rather than HW_P2V(ramdisk_paddr) - kvmalloc() (also
+  // called from main(), before this) already patched that entry's
+  // phys_start/phys_end from ramdisk_paddr/ramdisk_size and built
+  // kpgdir with it included, and every process's own pgdir gets it too
+  // from here on (setupkvm() installs every kmap[] entry into every
+  // process's page table - unlike the old boot-time-only kmapphys()
+  // call this replaced, which only ever reached whichever single pgdir
+  // happened to be active at this exact call site).
 }
 
 void
@@ -79,7 +93,7 @@ iderw(struct buf *b)
   if(b->blockno >= FSSIZE)
     panic("iderw: blockno out of range");
 
-  disk = (char*)P2V(RAMDISK_PADDR) + (uintp)b->blockno * BSIZE;
+  disk = (char*)RAMDISK_VBASE + (uintp)b->blockno * BSIZE;
   if(b->flags & B_DIRTY){
     memmove(disk, b->data, BSIZE);
     b->flags &= ~B_DIRTY;
