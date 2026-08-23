@@ -35,6 +35,13 @@ int gui_connect(struct gui_conn *c, const char *sockpath);
 int gui_create_surface(struct gui_conn *c, int w, int h, int x, int y,
                         int flags, const char *title);
 
+// Asks the compositor for the framebuffer's current size, without
+// allocating a window/shm block the way gui_create_surface() would -
+// for a client (gui/login_gui.c) that needs screen_w/screen_h up
+// front to compute a centered placement, before it has anything to
+// actually display. Returns 0 on success, -1 on failure.
+int gui_query_screen(struct gui_conn *c, unsigned int *screen_w, unsigned int *screen_h);
+
 // Tells the compositor the surface's current pixel contents are ready
 // to be composited (blitted into the real framebuffer on the next
 // redraw). Returns 0 on success, -1 on failure.

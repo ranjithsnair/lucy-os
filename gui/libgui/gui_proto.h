@@ -48,6 +48,13 @@ enum {
   // libvterm's vterm_set_size() so the shell reflows instead of just
   // being stretched).
   GUI_MSG_RESIZE = 11,        // compositor -> client, new shm fd via SCM_RIGHTS
+  // Lets a client (gui/login_gui.c) learn the framebuffer size right
+  // after connecting, to compute a centered placement up front - no
+  // window/shm allocation involved, unlike GUI_MSG_CREATE_SURFACE,
+  // so a client no longer has to create-and-destroy a throwaway probe
+  // surface just to read screen_w/screen_h off its reply.
+  GUI_MSG_QUERY_SCREEN = 12,  // client -> compositor, no payload beyond type
+  GUI_MSG_SCREEN_INFO = 13,   // compositor -> client
 };
 
 #define GUI_MAX_TASKS 8 // == MAXWIN (gui/compositor.c) - one taskbar
@@ -116,6 +123,15 @@ struct gui_msg_destroy {
   int surface_id;
 };
 
+struct gui_msg_query_screen {
+  int type;
+};
+
+struct gui_msg_screen_info {
+  int type;
+  unsigned int screen_w, screen_h;
+};
+
 struct gui_msg_key_event {
   int type;
   int ch;      // ASCII byte from kbdgetc() (kernel/kbd.c) - press-only, no separate release event
@@ -173,6 +189,8 @@ union gui_msg {
   struct gui_msg_task_list task_list;
   struct gui_msg_task_action task_action;
   struct gui_msg_resize resize;
+  struct gui_msg_query_screen query_screen;
+  struct gui_msg_screen_info screen_info;
 };
 
 #endif

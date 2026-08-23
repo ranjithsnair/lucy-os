@@ -563,6 +563,42 @@ redraw_all(void)
 	// to reach the real framebuffer via mark_dirty()/flush_dirty().
 }
 
+static int wallpaper_pending = 1;
+
+// The wallpaper is a multi-megabyte raw dump (see gfx_load_raw()'s own
+// per-pixel format-conversion loop) - loading it eagerly at startup
+// used to block this process from ever reaching epoll_wait(), which
+// meant the boot splash just sat frozen on screen for the whole load
+// before the first client (gui/login_gui.c) could even connect.
+// Instead, wallpaper.pixels starts (and stays) 0 - redraw_all() falls
+// back to COLOR_BG - so the very first client's window can appear on
+// a flat desktop almost immediately; this is called once, right after
+// that first commit already reached the real framebuffer, to load the
+// real wallpaper in the background and swap it in behind whatever's
+// already on screen. wallpaper_pending gates it to a single attempt
+// regardless of how many commits arrive afterward.
+static void
+load_wallpaper_deferred(void)
+{
+	if (!wallpaper_pending)
+		return;
+	wallpaper_pending = 0;
+
+	// wallpaper.pixels stays 0 (redraw_all() falls back to COLOR_BG) if
+	// the asset is missing or doesn't match the real resolution - no
+	// general image scaler, see tools/genraw.py's own comment.
+	gfx_load_raw(&wallpaper, WALLPAPER_PATH, &fbsurf);
+	if (wallpaper.pixels && (wallpaper.w != fbsurf.w || wallpaper.h != fbsurf.h)) {
+		free(wallpaper.pixels);
+		wallpaper.pixels = 0;
+	}
+	if (wallpaper.pixels) {
+		redraw_all();
+		mark_dirty_full();
+		flush_dirty();
+	}
+}
+
 static void
 handle_create_surface(int epfd, int fd, struct gui_msg_create_surface *req)
 {
@@ -819,16 +855,9 @@ main(void)
 
 	cursor_x = (int)fbsurf.w / 2;
 	cursor_y = (int)fbsurf.h / 2;
-	// wallpaper.pixels stays 0 (redraw_all() falls back to COLOR_BG) if
-	// the asset is missing or doesn't match the real resolution - no
-	// general image scaler, see tools/genraw.py's own comment.
-	gfx_load_raw(&wallpaper, WALLPAPER_PATH, &fbsurf);
-	if (wallpaper.pixels && (wallpaper.w != fbsurf.w || wallpaper.h != fbsurf.h)) {
-		free(wallpaper.pixels);
-		wallpaper.pixels = 0;
-	}
 	// cursor_img.pixels stays 0 (draw_cursor() falls back to the ASCII
-	// arrow) if the asset is missing.
+	// arrow) if the asset is missing - small enough to load eagerly,
+	// unlike the wallpaper (see load_wallpaper_deferred() below).
 	gfx_load_raw_rgba(&cursor_img, CURSOR_PATH);
 	// Deliberately no redraw_all()/flush here: bash/poc/dinit.c runs
 	// gui/bootsplash.c before this process ever starts, and that
@@ -1136,6 +1165,7 @@ main(void)
 						mark_dirty_full();
 					}
 					flush_dirty();
+					load_wallpaper_deferred();
 					break;
 				}
 				case GUI_MSG_DESTROY:
@@ -1148,6 +1178,16 @@ main(void)
 					mark_dirty_full();
 					flush_dirty();
 					break;
+				case GUI_MSG_QUERY_SCREEN: {
+					union gui_msg reply;
+
+					memset(&reply, 0, sizeof(reply));
+					reply.screen_info.type = GUI_MSG_SCREEN_INFO;
+					reply.screen_info.screen_w = fbsurf.w;
+					reply.screen_info.screen_h = fbsurf.h;
+					wire_send(fd, &reply, sizeof(reply), -1);
+					break;
+				}
 				case GUI_MSG_TASK_SUBSCRIBE:
 					taskbar_fd = fd;
 					send_task_list();

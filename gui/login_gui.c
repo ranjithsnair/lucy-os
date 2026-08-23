@@ -9,16 +9,17 @@
  *
  * Restyled (ToaruOS-style GUI rewrite) to match ToaruOS's own
  * glogin-provider.c: a centered rounded translucent "glass" box over a
- * blurred crop of the desktop wallpaper, antialiased DejaVu Sans/Sans-
- * Bold text (gui/libgui/ttf.c), a cyan-blue focus ring on the active
- * field, and a masked password field. The compositor has no real
- * per-pixel alpha compositing (see gui/compositor.c's own comment on
- * why the desktop background is compositor-drawn, not a client
- * surface) - the "glass" effect is faked entirely within this client's
- * own opaque committed surface: it independently loads and blurs the
- * same wallpaper asset, crops exactly the region behind its own
- * (self-chosen, centered) screen position, and blends its translucent
- * box on top of that local copy before ever committing.
+ * plain dark panel, antialiased DejaVu Sans/Sans-Bold text
+ * (gui/libgui/ttf.c), a cyan-blue focus ring on the active field, and
+ * a masked password field. Earlier revisions blurred a live crop of
+ * the desktop wallpaper behind the box instead of a flat panel, but
+ * that meant re-reading and re-decoding the same multi-megabyte
+ * wallpaper.raw the compositor had *just* loaded for the exact same
+ * purpose (see gui/compositor.c's own load) - measurably the largest
+ * chunk of the delay between the boot splash exiting and this screen
+ * ever appearing (kernel/fs.c's readi_bulk_run() comment has the
+ * numbers). A flat panel needs no asset load at all, so this window
+ * can render its very first frame the moment the font files are in.
  *
  * On successful auth: setgid()+setuid() to the authenticated account
  * (group before user - dropping uid away from root also drops the
@@ -65,41 +66,19 @@ enum { ST_USER, ST_PASS };
 
 struct login_ui {
 	struct gui_conn c;
-	struct gfx_surface wallpaper;   /* independently loaded, own format */
 	struct ttf_font *sans, *sans_bold;
 	int winx, winy;                 /* our own chosen screen position */
 };
 
-/* Fills the whole window with a seamless base layer: the sharp
- * wallpaper crop matching our real screen position (so the window's
- * own edges are invisible against the desktop), then a blurred crop
- * pasted under just the glass box's bounding rect, then the
- * translucent rounded tint on top. Called once up front - text/fields
- * are drawn per-frame on top of this already-composited background by
- * render(), not recomputed each time (the blur is the expensive part).
- */
+/* Fills the whole window with a flat dark base layer, then the
+ * translucent rounded glass tint on top. Called once up front -
+ * text/fields are drawn per-frame on top of this already-composited
+ * background by render(). See this file's header comment for why
+ * this is a flat panel rather than a blurred wallpaper crop. */
 static void
 paint_background(struct login_ui *ui)
 {
-	struct gfx_surface blurbuf;
-
-	if (ui->wallpaper.pixels) {
-		gfx_blit(&ui->c.surface, 0, 0, &ui->wallpaper, ui->winx, ui->winy, WIN_W, WIN_H);
-
-		blurbuf = ui->c.surface;
-		blurbuf.pixels = malloc((unsigned long)ui->c.surface.pitch * WIN_H);
-		if (blurbuf.pixels) {
-			blurbuf.w = WIN_W;
-			blurbuf.h = WIN_H;
-			gfx_blit(&blurbuf, 0, 0, &ui->wallpaper, ui->winx, ui->winy, WIN_W, WIN_H);
-			gfx_box_blur(&blurbuf, 8);
-			gfx_blit(&ui->c.surface, BOX_MARGIN, BOX_MARGIN, &blurbuf,
-			         BOX_MARGIN, BOX_MARGIN, WIN_W - 2 * BOX_MARGIN, WIN_H - 2 * BOX_MARGIN);
-			free(blurbuf.pixels);
-		}
-	} else {
-		gfx_fill_rect(&ui->c.surface, 0, 0, WIN_W, WIN_H, 0x181818);
-	}
+	gfx_fill_rect(&ui->c.surface, 0, 0, WIN_W, WIN_H, 0x181818);
 
 	gfx_fill_rounded_rect_alpha(&ui->c.surface, BOX_MARGIN, BOX_MARGIN,
 	                             WIN_W - BOX_MARGIN, WIN_H - BOX_MARGIN,
@@ -191,26 +170,25 @@ main(void)
 		}
 	}
 
-	/* Probe placement first (auto-cascade) purely to learn the real
-	 * screen size from the reply, then destroy and recreate centered -
-	 * the wire protocol has no separate "query screen size" message,
-	 * and a client can't compute a centered position without first
-	 * knowing what it's centering within. See gui_proto.h's own
-	 * comment on gui_msg_surface_created's screen_w/screen_h. */
-	if (gui_create_surface(&ui.c, WIN_W, WIN_H, -1, -1, GUI_WIN_BORDERLESS, "login") < 0) {
-		printf("login_gui: gui_create_surface (probe) failed\n");
-		return 1;
+	/* Learn the real screen size via a lightweight query (gui_proto.h's
+	 * GUI_MSG_QUERY_SCREEN) so this window can be created centered on
+	 * the first and only gui_create_surface() call - no more probe-
+	 * create-destroy-recreate round trip through the compositor. */
+	{
+		unsigned int screen_w, screen_h;
+
+		if (gui_query_screen(&ui.c, &screen_w, &screen_h) < 0) {
+			printf("login_gui: gui_query_screen failed\n");
+			return 1;
+		}
+		ui.winx = (int)(screen_w - WIN_W) / 2;
+		ui.winy = (int)(screen_h - WIN_H) / 2;
 	}
-	ui.winx = (int)(ui.c.screen_w - WIN_W) / 2;
-	ui.winy = (int)(ui.c.screen_h - WIN_H) / 2;
-	gui_destroy(&ui.c);
-	if (gui_connect(&ui.c, GUI_SOCK_PATH) < 0 ||
-	    gui_create_surface(&ui.c, WIN_W, WIN_H, ui.winx, ui.winy, GUI_WIN_BORDERLESS, "login") < 0) {
-		printf("login_gui: gui_create_surface (final) failed\n");
+	if (gui_create_surface(&ui.c, WIN_W, WIN_H, ui.winx, ui.winy, GUI_WIN_BORDERLESS, "login") < 0) {
+		printf("login_gui: gui_create_surface failed\n");
 		return 1;
 	}
 
-	gfx_load_raw(&ui.wallpaper, "/usr/share/wallpaper.raw", &ui.c.surface);
 	ui.sans = ttf_load("/usr/share/fonts/dejavu/DejaVuSans.ttf");
 	ui.sans_bold = ttf_load("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf");
 	if (!ui.sans || !ui.sans_bold) {

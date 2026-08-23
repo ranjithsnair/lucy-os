@@ -89,6 +89,26 @@ gui_create_surface(struct gui_conn *c, int w, int h, int x, int y,
 }
 
 int
+gui_query_screen(struct gui_conn *c, unsigned int *screen_w, unsigned int *screen_h)
+{
+  struct gui_msg_query_screen req;
+  union gui_msg resp;
+
+  req.type = GUI_MSG_QUERY_SCREEN;
+  if (wire_send(c->fd, &req, sizeof(req), -1) != (int)sizeof(req))
+    return -1;
+
+  if (wire_recv(c->fd, &resp, sizeof(resp), 0) <= 0)
+    return -1;
+  if (resp.type != GUI_MSG_SCREEN_INFO)
+    return -1;
+
+  *screen_w = resp.screen_info.screen_w;
+  *screen_h = resp.screen_info.screen_h;
+  return 0;
+}
+
+int
 gui_commit(struct gui_conn *c)
 {
   struct gui_msg_commit msg;
