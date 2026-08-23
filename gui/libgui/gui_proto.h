@@ -80,6 +80,17 @@ struct gui_task_entry {
 // terminal), but the login screen is borderless and still very much
 // needs focus to receive typed keystrokes at all.
 #define GUI_WIN_NO_FOCUS 0x2
+// GUI_WIN_DESKTOP_BG: only meaningful alongside GUI_WIN_NO_FOCUS.
+// Without it, a NO_FOCUS window (gui/compositor.c's redraw_all()) is
+// drawn in its own always-on-top pass, above every ordinary window -
+// right for a taskbar/panel (gui/desktop.c's top bar), but wrong for
+// a desktop icon: a normal window (e.g. a freshly launched terminal)
+// that happens to overlap the icon's fixed screen position would
+// always render underneath it. This flag moves a NO_FOCUS window into
+// a separate bottom-most pass instead, drawn before ordinary windows
+// - the same "lives on the desktop background, below every real
+// window" layer icons occupy on any real desktop.
+#define GUI_WIN_DESKTOP_BG 0x4
 
 struct gui_msg_create_surface {
   int type;

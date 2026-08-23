@@ -231,7 +231,8 @@ main(void)
 	// - the thing the user actually clicks - exists and can be drawn
 	// before the bar's does, instead of after.
 	if (gui_connect(&d.icon, GUI_SOCK_PATH) < 0 ||
-	    gui_create_surface(&d.icon, ICON_W, ICON_H, ICON_X, ICON_Y, GUI_WIN_BORDERLESS | GUI_WIN_NO_FOCUS, "desktop-icon") < 0) {
+	    gui_create_surface(&d.icon, ICON_W, ICON_H, ICON_X, ICON_Y,
+	                        GUI_WIN_BORDERLESS | GUI_WIN_NO_FOCUS | GUI_WIN_DESKTOP_BG, "desktop-icon") < 0) {
 		printf("desktop: icon create failed\n");
 		return 1;
 	}
@@ -244,8 +245,26 @@ main(void)
 	}
 	gui_task_subscribe(&d.bar);
 
+	// Commit both windows with their existing zero-asset fallbacks
+	// (render_bar()/render_icon()'s own `pixels`-null checks - solid
+	// colors, no text since d.sans/d.sans_bold are still null and
+	// ttf_draw_string() is a no-op without a font) before loading
+	// anything from disk. Same fix shape as gui/compositor.c's
+	// load_wallpaper_deferred(): the bar and icon appear on screen
+	// immediately after login instead of only once the wallpaper crop
+	// and both font files have finished loading below.
+	render_icon(&d, 0);
+	render_bar(&d);
+
+	// Fonts and the terminal icon image are both small, fast loads -
+	// get the icon showing its real picture/label and the bar its real
+	// text as soon as possible, well before the much larger wallpaper
+	// crop below (a full-screen read) is anywhere near done.
 	d.sans = ttf_load("/usr/share/fonts/dejavu/DejaVuSans.ttf");
 	d.sans_bold = ttf_load("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf");
+	gfx_load_raw_rgba(&d.icon_img, "/usr/share/icons/terminal.raw");
+	render_icon(&d, 0);
+	render_bar(&d);
 
 	// Load the full wallpaper exactly once (both crops below read from
 	// this same copy) and deliberately never free it: kernel/sysproc.c's
@@ -277,8 +296,8 @@ main(void)
 				gfx_blit(&d.wallpaper_icon, 0, 0, &full, ICON_X, ICON_Y, ICON_W, ICON_H);
 		}
 	}
-	gfx_load_raw_rgba(&d.icon_img, "/usr/share/icons/terminal.raw");
 
+	// Wallpaper crop is in now too - redraw both windows once more.
 	render_icon(&d, 0);
 	render_bar(&d);
 

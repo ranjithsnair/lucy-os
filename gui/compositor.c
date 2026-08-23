@@ -188,6 +188,20 @@ draw_cursor(struct gfx_surface *s, int x, int y)
 // fb_info's own precedent, just below).
 #define TOPBAR_RESERVED_H 27
 
+// Default cascade origin for a new window that didn't request a
+// specific (x,y) - see handle_create_surface() below. Kept clear of
+// gui/desktop.c's own fixed desktop-icon rect (ICON_X=20, ICON_Y=40,
+// ICON_W=ICON_H=72 there) for the same reason TOPBAR_RESERVED_H above
+// keeps clear of its top bar: GUI_WIN_DESKTOP_BG (gui_proto.h) already
+// makes the icon render behind any ordinary window that happens to
+// overlap it, but a brand-new window (e.g. gui/terminal.c, launched by
+// double-clicking that very icon) starting out on top of the thing the
+// user just clicked reads as broken even when the compositing order is
+// technically correct - simplest fix is to just not cascade into that
+// corner at all.
+#define CASCADE_BASE_X 140
+#define CASCADE_BASE_Y 60
+
 #define WALLPAPER_PATH "/usr/share/wallpaper.raw"
 
 struct window {
@@ -516,12 +530,27 @@ redraw_all(void)
 	else
 		gfx_fill_rect(&backbuf, 0, 0, (int)backbuf.w, (int)backbuf.h, COLOR_BG);
 
+	// GUI_WIN_DESKTOP_BG windows (the desktop icon) sit on the
+	// background layer, below every ordinary window - drawn first so
+	// any normal window overlapping them (e.g. a freshly launched
+	// terminal cascaded right over the icon's fixed position) covers
+	// them, the same as any real desktop's icon-vs-window stacking.
 	for (i = 0; i < nz; i++) {
 		idx = zorder[i];
 		w = &windows[idx];
-		// NO_FOCUS windows (the desktop bar/icon) are drawn in a
-		// second, always-on-top pass below instead - otherwise a
-		// maximized window (which fills everything below
+		if (w->minimized || !(w->flags & GUI_WIN_DESKTOP_BG))
+			continue;
+		if (w->committed)
+			gfx_blit(&backbuf, w->x, w->y, &w->surf, 0, 0, (int)w->surf.w, (int)w->surf.h);
+	}
+
+	for (i = 0; i < nz; i++) {
+		idx = zorder[i];
+		w = &windows[idx];
+		// NO_FOCUS windows (the desktop bar/icon) are drawn outside
+		// ordinary z-order, in either the pass just above (icon) or
+		// the second, always-on-top pass below (bar) instead -
+		// otherwise a maximized window (which fills everything below
 		// TOPBAR_RESERVED_H, but is still just an ordinary z-order
 		// entry) could paint right over the panel the moment it's
 		// raised above it.
@@ -551,7 +580,7 @@ redraw_all(void)
 	for (i = 0; i < nz; i++) {
 		idx = zorder[i];
 		w = &windows[idx];
-		if (w->minimized || !(w->flags & GUI_WIN_NO_FOCUS))
+		if (w->minimized || !(w->flags & GUI_WIN_NO_FOCUS) || (w->flags & GUI_WIN_DESKTOP_BG))
 			continue;
 		if (w->committed)
 			gfx_blit(&backbuf, w->x, w->y, &w->surf, 0, 0, (int)w->surf.w, (int)w->surf.h);
@@ -667,8 +696,8 @@ handle_create_surface(int epfd, int fd, struct gui_msg_create_surface *req)
 	windows[idx].committed = 0;
 	windows[idx].flags = req->flags;
 	if (req->x == -1 && req->y == -1) {
-		windows[idx].x = 40 + 30 * cascade;
-		windows[idx].y = 40 + 30 * cascade;
+		windows[idx].x = CASCADE_BASE_X + 30 * cascade;
+		windows[idx].y = CASCADE_BASE_Y + 30 * cascade;
 		cascade = (cascade + 1) % 6;
 	} else {
 		windows[idx].x = req->x;
