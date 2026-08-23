@@ -102,3 +102,19 @@ iderw(struct buf *b)
   }
   b->flags |= B_VALID;
 }
+
+// Reads nblocks contiguous blocks (blockno..blockno+nblocks) straight
+// out of the ramdisk into dst, bypassing the buffer cache entirely -
+// kernel/fs.c's readi() is the only caller, for a bulk run it has
+// already confirmed (kernel/bio.c's bio_range_clean()) has no dirty,
+// not-yet-written-back buffer anywhere in it, so this and the cache
+// are guaranteed to agree. One memmove() instead of nblocks separate
+// bget()/bread()/brelse() cycles - see readi()'s own comment for why
+// that distinction is what actually matters here.
+void
+ide_bulk_read(uint blockno, char *dst, uint nblocks)
+{
+  if((uintp)blockno + nblocks > FSSIZE)
+    panic("ide_bulk_read: out of range");
+  memmove(dst, (char*)RAMDISK_VBASE + (uintp)blockno * BSIZE, (uintp)nblocks * BSIZE);
+}

@@ -96,6 +96,37 @@ bget(uint dev, uint blockno)
   panic("bget: no buffers");
 }
 
+// True iff no buffer currently cached for dev covers any block in
+// [start_bn, start_bn+nblocks) with an unwritten change (B_DIRTY) -
+// kernel/fs.c's readi() checks this once per contiguous bulk run,
+// before bypassing the cache entirely for that run (kernel/ide.c's
+// ide_bulk_read()): the cache and the ramdisk it fronts only disagree
+// while a write sits in a buffer that hasn't been flushed back yet
+// (kernel/log.c's job, on commit), so this is what makes a bulk-bypass
+// read safe rather than a hard-coded assumption. A held (not just
+// B_VALID) buffer with B_DIRTY set is exactly what bget() itself
+// already treats as "still in use, don't recycle" (its own comment
+// above) - same reasoning applies here: it's still in use, in the
+// "hasn't reached the ramdisk yet" sense this function cares about.
+int
+bio_range_clean(uint dev, uint start_bn, uint nblocks)
+{
+  struct buf *b;
+  int clean;
+
+  acquire(&bcache.lock);
+  clean = 1;
+  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+    if(b->dev == dev && (b->flags & B_DIRTY) &&
+       b->blockno >= start_bn && b->blockno < start_bn + nblocks){
+      clean = 0;
+      break;
+    }
+  }
+  release(&bcache.lock);
+  return clean;
+}
+
 // Return a locked buf with the contents of the indicated block.
 struct buf*
 bread(uint dev, uint blockno)

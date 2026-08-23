@@ -20,6 +20,7 @@ void            binit(void);
 struct buf*     bread(uint, uint);
 void            brelse(struct buf*);
 void            bwrite(struct buf*);
+int             bio_range_clean(uint, uint, uint);
 
 // console.c
 void            consoleinit(void);
@@ -69,6 +70,7 @@ int             permcheck(struct inode*, int, int, int);
 void            ideinit(void);
 void            ideintr(void);
 void            iderw(struct buf*);
+void            ide_bulk_read(uint, char*, uint);
 
 // limine.c
 void            limine_early_init(void);

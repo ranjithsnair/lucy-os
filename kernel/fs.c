@@ -619,9 +619,54 @@ permcheck(struct inode *ip, int euid, int egid, int want)
   return ((bits & want) == want) ? 0 : -1;
 }
 
+// Extends a bulk, cache-bypassing read (kernel/ide.c's ide_bulk_read())
+// as far as it safely can from logical block bn, up to maxblocks whole
+// blocks: stops at the first logical block whose on-disk address isn't
+// exactly one past the previous one (bmap() making them non-contiguous
+// - not guaranteed in general, though mkfs lays out a large file's
+// blocks sequentially in practice, which is exactly the case this is
+// for - a multi-megabyte asset like the wallpaper or a TTF font). Only
+// actually bypasses the cache if bio_range_clean() (kernel/bio.c)
+// confirms none of those on-disk blocks currently have an unwritten
+// change sitting in a buffer; falls back to the plain per-block path
+// below (returns 0) otherwise - correctness always wins over the
+// optimization. See readi()'s own comment for why this exists at all.
+static uint
+readi_bulk_run(struct inode *ip, char *dst, uint bn, uint maxblocks)
+{
+  uint addr, first_addr, nb;
+
+  first_addr = bmap(ip, bn);
+  for(nb = 1; nb < maxblocks; nb++){
+    addr = bmap(ip, bn + nb);
+    if(addr != first_addr + nb)
+      break;
+  }
+  if(!bio_range_clean(ip->dev, first_addr, nb))
+    return 0;
+  ide_bulk_read(first_addr, dst, nb);
+  return nb;
+}
+
 //PAGEBREAK!
 // Read data from inode.
 // Caller must hold ip->lock.
+//
+// Tries readi_bulk_run() first whenever a whole aligned block or more
+// remains - one memmove() for a whole run of contiguous, clean blocks
+// instead of a bread()/memmove()/brelse() per block. That distinction
+// matters: kernel/bio.c's bget() does an O(NBUF) linear scan (cache
+// hit or miss) plus a lock acquire/release on *every* call, so a large
+// sequential read - this kernel's own wallpaper/TTF font assets run
+// into the thousands of blocks - paid that cost once per block for
+// data it would only ever touch once, measured as several real seconds
+// of delay before the login screen could finish loading its own
+// background and fonts. Falls back to the original single-block path
+// (unchanged below) for any misaligned remainder, a non-contiguous or
+// dirty-covered stretch, or a file too small for the bulk path to ever
+// trigger - metadata-heavy access patterns (repeatedly re-reading a
+// directory or inode block) still go through the ordinary cache path
+// exactly as before, since those still benefit from it.
 int
 readi(struct inode *ip, char *dst, uint off, uint n)
 {
@@ -640,6 +685,13 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    if(off % BSIZE == 0 && n - tot >= BSIZE){
+      uint nb = readi_bulk_run(ip, dst, off / BSIZE, (n - tot) / BSIZE);
+      if(nb > 0){
+        m = nb * BSIZE;
+        continue;
+      }
+    }
     bp = bread(ip->dev, bmap(ip, off/BSIZE));
     m = min(n - tot, BSIZE - off%BSIZE);
     memmove(dst, bp->data + off%BSIZE, m);
