@@ -96,19 +96,30 @@ pagerefslot(uintp pa)
   panic("pagerefslot");
 }
 
-// Translate a kernel virtual pointer - either KERNBASE-based (the main
-// pool, kalloc.c's oldest address space) or DMAP_VBASE-based (kernel/
-// limine.c's dmap_init_pool()-donated pages) - to the physical address
-// pagerefslot() above needs. The two ranges are numerically unrelated
-// (DMAP_VBASE < KERNBASE - see memlayout.h) so plain V2P() would
-// silently compute garbage for a DMAP pointer; ISDMAPVA() (memlayout.h)
-// is what tells the two apart.
-static uintp
-kva2pa(char *v)
+// True iff pa is a kalloc()-managed page - the main pool (ISPOOLPA,
+// memlayout.h) or the direct-map-donated one above (dmap_pageref) -
+// as opposed to genuine external device memory (e.g. the real
+// framebuffer's VRAM, mapped in by kernel/sysproc.c's sys_mmap()
+// FRAMEBUFFER path) that just happens to have a user PTE pointing at
+// it. kernel/vm.c's copyuvm()/deallocuvm() need this, not plain
+// ISPOOLPA(pa) (which only ever covered the original, smaller pool),
+// to correctly recognize a dmap-donated user page as COW/refcount-
+// eligible ordinary RAM. Found the hard way: every user page copyuvm()
+// misjudged this way got mapped straight into a fork()'d child with no
+// COW protection and no added reference - both processes silently
+// shared and could each write the same physical page, and whichever
+// exited first freed it out from under the other, corrupting it a
+// moment later (deallocuvm() has the identical blind spot for freeing
+// - a leak, not a corruption, but the same root cause) - reliably
+// crashing every dynamically-linked child's own ld.so startup within
+// a few instructions, while a fresh exec with no fork() in its history
+// (e.g. this kernel's very first process) was never affected.
+int
+kmanaged(uintp pa)
 {
-  if(ISDMAPVA(v))
-    return DMAP_V2P(v);
-  return V2P(v);
+  if(pa >= kernbase_paddr && pa < pool_end)
+    return 1;
+  return dmap_pageref != 0 && pa < dmap_pageref_count * (uintp)PGSIZE;
 }
 
 // freerange(), minus whatever part of [vstart,vend) falls inside
@@ -183,33 +194,34 @@ freerange(void *vstart, void *vend)
 // never incremented in the first place.
 //
 // v can be either a main-pool (KERNBASE-based) or direct-map
-// (DMAP_VBASE-based) pointer - kva2pa() tells them apart. The `v < end`
-// bound only makes sense for the former (a DMAP pointer is numerically
-// far below `end`, an address near KERNBASE), hence the separate branch.
+// (DMAP_VBASE-based) pointer - V2P() (memlayout.h) tells them apart and
+// translates accordingly. The `v < end` bound only makes sense for the
+// former (a DMAP pointer is numerically far below `end`, an address near
+// KERNBASE), hence the separate branch.
 void
 kfree(char *v)
 {
   struct run *r;
   ushort *slot;
-  int dofree;
+  int dofree, fresh;
   uintp pa;
 
   if((uintp)v % PGSIZE)
     panic("kfree");
+  pa = V2P(v);
   if(ISDMAPVA(v)){
-    pa = DMAP_V2P(v);
     if(pa >= dmap_end)
       panic("kfree");
   } else {
-    if(v < end || V2P(v) >= pool_end)
+    if(v < end || pa >= pool_end)
       panic("kfree");
-    pa = V2P(v);
   }
   slot = pagerefslot(pa);
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
-  if(*slot == 0)
+  fresh = (*slot == 0);
+  if(fresh)
     dofree = 1;
   else if(--*slot == 0)
     dofree = 1;
@@ -217,8 +229,18 @@ kfree(char *v)
     dofree = 0;
   if(dofree){
     // Fill with junk to catch dangling refs - only safe now that we
-    // know no other mapping still shares this physical page.
-    memset(v, 1, PGSIZE);
+    // know no other mapping still shares this physical page. Skipped
+    // for a fresh page (never through kalloc() before - freerange()'s/
+    // dmap_init_pool()'s own initial seeding): nothing could hold a
+    // dangling reference to a page that's never been handed out, and
+    // writing it unconditionally here would mean touching - and, on a
+    // hypervisor, forcing the host to actually back - every single byte
+    // of however much RAM dmap_init_pool() donates, which can be most
+    // of a real machine's memory. Found the hard way (a boot that
+    // looked hung for minutes on an 11GB VM, actually just the host
+    // thrashing under the memory pressure of dirtying all of it at once).
+    if(!fresh)
+      memset(v, 1, PGSIZE);
     r = (struct run*)v;
     r->next = kmem.freelist;
     kmem.freelist = r;
@@ -274,9 +296,9 @@ kalloc(void)
     // of what it was last used for (kfree() only ever leaves a page on
     // the freelist once its refcount already reached 0) - set, not
     // increment. r can be either a main-pool or direct-map pointer
-    // (kfree() pushes both kinds onto the same freelist) - kva2pa()
-    // tells them apart the same way kfree() does.
-    *pagerefslot(kva2pa((char*)r)) = 1;
+    // (kfree() pushes both kinds onto the same freelist) - V2P()
+    // (memlayout.h) tells them apart the same way kfree() does.
+    *pagerefslot(V2P((char*)r)) = 1;
   }
   if(kmem.use_lock)
     release(&kmem.lock);

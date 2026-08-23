@@ -1954,7 +1954,8 @@ dist: $(BUILD)/$(IMAGE_NAME).hdd $(BUILD)/$(IMAGE_NAME).iso
 	cp $(BUILD)/$(IMAGE_NAME).iso $(DISTDIR)/$(IMAGE_NAME).iso
 
 run: all
-	$(QEMU) $(QEMUOPTS_BIOS) </dev/null >/dev/null 2>&1 &
+	$(QEMU) $(QEMUOPTS_BIOS) </dev/null >/dev/null &
+	@echo "poc-os launched in its own QEMU window (serial/monitor: Ctrl-Alt-2/3 inside it)."
 
 clean:
 	rm -rf $(BUILD)

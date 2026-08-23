@@ -93,6 +93,7 @@ void            kinit2(void*, void*, uintp, uintp);
 void            kaddref(uintp);
 int             kgetref(uintp);
 void            kdmapreserve(uintp, uintp);
+int             kmanaged(uintp);
 
 // kbd.c
 void            kbdintr(void);

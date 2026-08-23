@@ -399,6 +399,25 @@ switchuvm(struct proc *p)
 // just the low ones user memory and DEVSPACE populate: KERNBASE's own
 // slot (PML4X(KERNBASE)=511) holds the "I/O space"/"kern text+rodata"/
 // "kern data+memory" kmap[] entries.
+//
+// PML4X(DMAP_VBASE)=256 is the one exception, skipped entirely below:
+// unlike every other populated slot here, ensure_dmap() (setupkvm(),
+// above) installs it as a raw copy of one globally shared PML4 entry,
+// never rebuilt per-process - the PDPT/PD pages it points at belong to
+// every pgdir at once, not this one. Modeled on the same principle
+// ToaruOS's mmu_free() uses for its own shared slots (the direct map at
+// PML4 480/481, the kernel image at 510/511 - kernel/arch/x86_64/mmu.c):
+// a page-table teardown must never walk into a slot it didn't build
+// fresh for this pgdir. ToaruOS gets this for free by only ever walking
+// slots 0-255 (pure lower/user half) in the first place; poc-os's
+// kmap[]-derived upper-half slots (unlike ToaruOS's) genuinely are
+// process-private and do need freeing, so this skips just the one slot
+// that isn't, rather than bounding the walk the same way. Found the
+// hard way: without this, every process exit/exec freed the direct
+// map's own page-table pages out from under every other pgdir still
+// using them (including kpgdir), corrupting it - "panic: kfree" firing
+// from inside freevm() itself, on a page kfree() had already, validly,
+// freed via some *other* process's teardown moments earlier.
 void
 freevm(pde_t *pgdir)
 {
@@ -422,6 +441,8 @@ freevm(pde_t *pgdir)
   deallocuvm(pgdir, DEVSPACE, 0);
 
   for(i = 0; i < NPML4ENTRIES; i++){
+    if(i == PML4X(DMAP_VBASE))
+      continue;
     if(!(pgdir[i] & PTE_P))
       continue;
     pdpt = (pte_t*)P2V(PTE_ADDR(pgdir[i]));
@@ -469,7 +490,7 @@ deallocuvm(pde_t *pgdir, uintp oldsz, uintp newsz)
       pa = PTE_ADDR(*pte);
       if(pa == 0)
         panic("kfree");
-      // !ISPOOLPA(pa) (memlayout.h) means this PTE was never a
+      // !kmanaged(pa) (kernel/kalloc.c) means this PTE was never a
       // kalloc()'d page in the first place - the framebuffer's real
       // physical VRAM, mapped in by kernel/sysproc.c's sys_mmap()
       // FRAMEBUFFER path (kernel/vm.c's mapuvm_phys()), is the one
@@ -479,17 +500,20 @@ deallocuvm(pde_t *pgdir, uintp oldsz, uintp newsz)
       // either corrupt that pool or hit that exact panic the moment
       // any process holding such a mapping exits/execs/shrinks. Just
       // drop the mapping; there is nothing to return to the allocator.
+      // kmanaged(), not plain ISPOOLPA() (memlayout.h): the latter only
+      // covers the original pool, and would silently leak every dmap-
+      // donated page instead of ever kfree()'ing it back.
       //
       // PTE_SHM (include/mmu.h) is the same idea for a different
       // reason: kernel/shm.c's shared-memory pages *are* ordinary
-      // kalloc()'d RAM (always ISPOOLPA()), but - unlike every other
+      // kalloc()'d RAM (always kmanaged()), but - unlike every other
       // anonymous page reaching this loop - may still be mapped into a
       // second process's page table too. Freeing one process's mapping
       // here would yank memory out from under whoever else has it
       // mapped; the actual free happens once, in shmclose(), only
       // after the shm object's own struct file ref count (shared
       // across every fd/process referencing it) reaches zero.
-      if(ISPOOLPA(pa) && !(*pte & PTE_SHM)){
+      if(kmanaged(pa) && !(*pte & PTE_SHM)){
         char *v = P2V(pa);
         kfree(v);
       }
@@ -722,23 +746,26 @@ copyuvm(pde_t *pgdir, uintp sz)
     pa = PTE_ADDR(*pte);
     // Device memory (the framebuffer's real VRAM, mapped by
     // kernel/sysproc.c's sys_mmap() FRAMEBUFFER branch - always
-    // !ISPOOLPA(pa) (memlayout.h), the same test deallocuvm() below
+    // !kmanaged(pa) (kernel/kalloc.c), the same test deallocuvm() above
     // already uses to recognize "not ordinary kalloc()'d RAM, don't
     // kfree() it") is shared with the child directly, by mapping the
     // same physical page again, rather than copied: real mmap()'d
     // device memory stays shared across fork() on a real OS (the child
-    // sees the same live VRAM, not a frozen snapshot from fork() time),
-    // and copying it here isn't just semantically wrong but was
-    // impossible outright - P2V(pa) (include/memlayout.h) for a VRAM
-    // address like this (e.g. a real BIOS/QEMU VBE framebuffer at
-    // 0xfd000000) is nowhere near kernbase_paddr, so the result is a
-    // bogus source pointer for the memmove() below and panics the
-    // kernel on the very next fork() any process with the framebuffer
-    // mapped ever made - found via a real GDB backtrace (no prior
-    // test program had ever both mmap()'d the framebuffer and called
-    // fork(), so this was never exercised before GUI roadmap phase 7
-    // (libguitest.c) did both).
-    if(!ISPOOLPA(pa)){
+    // sees the same live VRAM, not a frozen snapshot from fork() time).
+    // kmanaged(), not plain ISPOOLPA() (memlayout.h): the latter only
+    // covers the original pool, so it wrongly took this same branch for
+    // any ordinary user page that happened to be backed by a dmap-
+    // donated physical page instead - sharing it with the child at full
+    // write permission, with no COW protection and no added reference,
+    // rather than the proper copy-on-write path below. Found the hard
+    // way: every such page got corrupted (both processes silently wrote
+    // the same physical page) and then freed out from under whichever
+    // process was still using it the moment the other one exited -
+    // reliably crashing a forked child's own dynamic-linker startup
+    // within its first few instructions, while a fresh exec with no
+    // fork() in its history (e.g. this kernel's very first process) was
+    // never affected.
+    if(!kmanaged(pa)){
       if(mappages(d, (void*)i, PGSIZE, pa, PTE_FLAGS(*pte)) < 0)
         goto bad;
       continue;

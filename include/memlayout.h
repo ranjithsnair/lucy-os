@@ -92,9 +92,6 @@ extern uintp pool_end;
 extern uintp dmap_end;
 #endif
 
-#define V2P(a) ((((uintp) (a)) - KERNBASE) + kernbase_paddr)
-#define P2V(a) ((void *)((((uintp) (a)) - kernbase_paddr) + KERNBASE))
-
 // For fixed, absolute low physical addresses that exist at that same
 // spot on every x86 machine regardless of where Limine loaded this
 // kernel - the BIOS Data Area, the legacy CGA text buffer, the MP
@@ -153,5 +150,49 @@ extern uintp dmap_end;
 #define DMAP_VBASE 0xFFFF800000000000ULL
 #define DMAP_P2V(pa) ((void *)(((uintp)(pa)) + DMAP_VBASE))
 #define DMAP_V2P(va) (((uintp)(va)) - DMAP_VBASE)
-#define ISDMAPPA(pa) ((pa) < dmap_end)
 #define ISDMAPVA(va) ((uintp)(va) >= DMAP_VBASE && (uintp)(va) < DMAP_VBASE + dmap_end)
+
+// V2P/P2V: kalloc() (kernel/kalloc.c) now transparently hands out pages
+// from two disjoint pools sharing one freelist - the original KERNBASE-
+// relative one and the direct-map-backed one kernel/limine.c's
+// dmap_init_pool() donates (dmap_pageref/kdmapreserve's own comments) -
+// so *every* existing caller that turns a kalloc()'d kernel pointer
+// into a physical address (or back) needs to know which VA scheme it's
+// looking at, not just apply the KERNBASE-relative formula unconditio-
+// nally. Rather than hunt down and fix every such call site (walknext()/
+// walkpgdir() alone use both directions on whatever physical page a PTE
+// happens to name), these two macros - already used everywhere in the
+// kernel for exactly this purpose - just do the right thing themselves.
+// Found the hard way: kernel/vm.c's switchuvm() calling the old,
+// KERNBASE-only V2P() on a process's pgdir silently produced a garbage
+// physical address (a huge, wildly wrong value from underflowing the
+// KERNBASE subtraction against a DMAP_VBASE-relative pointer) whenever
+// that pgdir happened to be a dmap-donated page - kalloc()'s freelist
+// is LIFO, so a freshly-donated pool this large dominates every kalloc()
+// call for a long stretch after boot - which reached lcr3() as an
+// invalid CR3 value and #GP'd on every attempt to actually run the
+// first user process.
+//
+// P2V(pa) prefers the traditional KERNBASE-relative alias for any pa
+// that's ALSO within the main pool's own range rather than always
+// taking the dmap alias: build_dmap() maps all of [0,dmap_end), which is
+// a superset of [kernbase_paddr,pool_end) - both aliases reach the same
+// physical page equally validly, but staying on the original alias here
+// preserves every existing assumption elsewhere in the kernel that
+// P2V()'s output for a main-pool page is KERNBASE-relative (e.g. bounds
+// checks against kernbase_paddr/pool_end). Deliberately NOT ISPOOLPA
+// (memlayout.h, above) here: that macro's strict "< pool_end" is right
+// for asking "is this a real page in the pool," but callers like
+// kernel/main.c's kinit1()/kinit2() call P2V(pool_end) itself - the
+// pool's own exclusive end, one-past-the-last-real-page, used only for
+// pointer arithmetic/comparison in freerange()'s loop, never
+// dereferenced there. ISPOOLPA(pool_end) is false, which would have
+// routed that call through DMAP_P2V() instead - a virtual address the
+// tiny entry.asm bootstrap page table (still active at kinit1()'s call
+// site, before kvmalloc() ever builds the direct map) doesn't map at
+// all. Found the hard way: an unhandled page fault before idtinit() has
+// even run yet, silently triple-faulting the machine back to the BIOS
+// on every boot attempt.
+#define V2P(a) (ISDMAPVA(a) ? DMAP_V2P(a) : ((((uintp) (a)) - KERNBASE) + kernbase_paddr))
+#define P2V(a) ((uintp)(a) >= kernbase_paddr && (uintp)(a) <= pool_end ? \
+                ((void *)((((uintp) (a)) - kernbase_paddr) + KERNBASE)) : DMAP_P2V(a))

@@ -97,6 +97,25 @@ uintp pool_end; // memlayout.h's ISPOOLPA() - the managed kalloc() pool
 uintp dmap_end; // memlayout.h's own comment on dmap_end/DMAP_VBASE.
 extern struct vbeinfo vbe; // kernel/vbe.c
 
+// A kernel-owned copy of the USABLE-typed entries out of Limine's own
+// memmap response, taken once by limine_early_init() below - not read
+// again from memmap_request.response afterward. Necessary, not just
+// tidy: memmap_request.response and the limine_memmap_entry structs it
+// points to live in ordinary physical RAM Limine handed the OS as
+// "usable", the same memory kernel/kalloc.c's allocator (via this
+// file's own dmap_init_pool(), called much later, after real memory
+// management has already started) can and does hand back out - found
+// the hard way (a boot CPU silently hanging partway through
+// dmap_init_pool(), registers showing kfree()'s own 0x01-byte junk
+// pattern where a live entry count should have been) after an earlier
+// version of dmap_init_pool() kept dereferencing memmap_request.response
+// directly, corrupting its own iteration state the moment a kfree() call
+// happened to land on the physical page backing it.
+#define DMAP_SNAPSHOT_MAX 128
+struct dmap_range { uintp base, end; };
+static struct dmap_range dmap_usable[DMAP_SNAPSHOT_MAX];
+static uint64 dmap_usable_count;
+
 // Boot-time PML4/PDPT/PD/PT, built and switched to by limine_entry_init()
 // below (called from kernel/entry.asm before main()). Two mappings:
 //   - high (VA [KERNBASE,KERNBASE+4MB) -> PA [kernel_paddr,+4MB)):
@@ -275,13 +294,23 @@ limine_early_init(void)
   // allocate - each 1GB of dmap_end costs exactly one (2MB-page PD
   // entries, no PT pages needed - see DMAP_VBASE's own comment on why
   // alignment is never an issue here), so even the cap is cheap.
+  // Snapshotted into dmap_usable[] here (dmap_usable's own comment
+  // explains why later code, dmap_init_pool(), must never go back to
+  // memmap_request.response directly) at the same time dmap_end itself
+  // is computed, since both need the exact same USABLE-entries scan.
   dmap_end = 0;
+  dmap_usable_count = 0;
   for(uint64 i = 0; i < nentries; i++){
     if(entries[i]->type != LIMINE_MEMMAP_USABLE)
       continue;
     uintp end = entries[i]->base + entries[i]->length;
     if(end > dmap_end)
       dmap_end = end;
+    if(dmap_usable_count < DMAP_SNAPSHOT_MAX){
+      dmap_usable[dmap_usable_count].base = entries[i]->base;
+      dmap_usable[dmap_usable_count].end = end;
+      dmap_usable_count++;
+    }
   }
   if(dmap_end > 0x1000000000ULL) // 64GB
     dmap_end = 0x1000000000ULL;
@@ -319,20 +348,19 @@ limine_early_init(void)
   }
 }
 
-// True iff physical page p falls inside some LIMINE_MEMMAP_USABLE
-// memmap entry - dmap_end (this file's own comment on it) is only the
-// *highest* such entry's end address, not a guarantee everything below
+// True iff physical page p falls inside some USABLE range dmap_usable[]
+// snapshotted (dmap_usable's own comment) - dmap_end is only the
+// *highest* such range's end address, not a guarantee everything below
 // it is real backed RAM (there can be large reserved/MMIO gaps in
 // between), so dmap_init_pool() below can't just treat all of
 // [0,dmap_end) as free the way freerange() treats [kernbase_paddr,
 // pool_end) - that range, unlike this one, was already trimmed to a
 // single contiguous USABLE run by limine_early_init() above.
 static int
-dmap_page_usable(struct limine_memmap_entry **entries, uint64 nentries, uintp p)
+dmap_page_usable(uintp p)
 {
-  for(uint64 i = 0; i < nentries; i++){
-    if(entries[i]->type == LIMINE_MEMMAP_USABLE &&
-       p >= entries[i]->base && p + PGSIZE <= entries[i]->base + entries[i]->length)
+  for(uint64 i = 0; i < dmap_usable_count; i++){
+    if(p >= dmap_usable[i].base && p + PGSIZE <= dmap_usable[i].end)
       return 1;
   }
   return 0;
@@ -369,22 +397,38 @@ dmap_page_excluded(uintp p)
 // passes: first hunting for enough contiguous, USABLE, not-already-
 // owned physical memory to hold that table itself (a linear byte-by-
 // byte scan, not entry-interval math, deliberately: simple and obviously
-// correct beats clever here, and even a full 64GB's worth of page-sized
-// steps is a trivial one-time boot cost), then a second pass handing
-// every remaining such page to kfree().
+// correct beats clever here), then a second pass handing every
+// remaining such page to kfree().
+//
+// Donation is capped well below dmap_end/build_dmap()'s own full
+// mapped range (which stays cheap at any size - see dmap_end's own
+// comment, build_dmap() just writes PD entries, never touches RAM
+// content): kfree() always writes its own freelist linkage into the
+// first bytes of every page it's given (see this file's top comment on
+// struct run), so donating dmap_end's *entire* remainder - many GB on a
+// real machine - would mean dirtying that much RAM at boot regardless
+// of anything else, which under host memory pressure (a hypervisor
+// backing every dirtied guest page on first touch) is exactly what
+// turned into what looked like an indefinite hang on an 11GB VM. This
+// kernel's actual GUI processes (kernel/main.c's dinit, launching
+// bootsplash/compositor/login_gui - the whole reason this pool needed
+// extending past the main pool in the first place) need nowhere near a
+// full multi-GB machine's worth of extra memory - a modest, fixed cap
+// is enough headroom without the eager-touch cost scaling with however
+// much RAM the host happens to have.
+#define DMAP_DONATE_CAP 0x80000000ULL // 2GB
 void
 dmap_init_pool(void)
 {
-  if(memmap_request.response == 0 || dmap_end == 0)
+  if(dmap_end == 0)
     return;
-  struct limine_memmap_entry **entries = memmap_request.response->entries;
-  uint64 nentries = memmap_request.response->entry_count;
+  uintp donate_limit = dmap_end < DMAP_DONATE_CAP ? dmap_end : DMAP_DONATE_CAP;
 
-  uintp pageref_bytes = PGROUNDUP((dmap_end / PGSIZE) * sizeof(ushort));
+  uintp pageref_bytes = PGROUNDUP((donate_limit / PGSIZE) * sizeof(ushort));
   uintp run_start = 0, run_len = 0, pageref_paddr = 0;
 
-  for(uintp p = 0; p < dmap_end; p += PGSIZE){
-    if(dmap_page_excluded(p) || !dmap_page_usable(entries, nentries, p)){
+  for(uintp p = 0; p < donate_limit; p += PGSIZE){
+    if(dmap_page_excluded(p) || !dmap_page_usable(p)){
       run_len = 0;
       continue;
     }
@@ -399,14 +443,14 @@ dmap_init_pool(void)
   if(pageref_paddr == 0)
     return; // no single run big enough - leave the extra RAM unmanaged
 
-  kdmapreserve(pageref_paddr, dmap_end / PGSIZE);
+  kdmapreserve(pageref_paddr, donate_limit / PGSIZE);
 
-  for(uintp p = 0; p < dmap_end; p += PGSIZE){
+  for(uintp p = 0; p < donate_limit; p += PGSIZE){
     if(dmap_page_excluded(p))
       continue;
     if(p >= pageref_paddr && p < pageref_paddr + pageref_bytes)
       continue;
-    if(!dmap_page_usable(entries, nentries, p))
+    if(!dmap_page_usable(p))
       continue;
     kfree(DMAP_P2V(p));
   }
