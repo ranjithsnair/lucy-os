@@ -130,21 +130,51 @@ fileread(struct file *f, char *addr, int n)
   if(f->type == FD_SHM || f->type == FD_EPOLL)
     return -1;  // mmap()/epoll_ctl() only - not a byte stream
   if(f->type == FD_INODE){
-    // A transaction (matching filewrite()'s own, just below) is needed
-    // here now too, even though a read "obviously" never used to touch
-    // the log: itruncto() (kernel/fs.c, ftruncate(2)'s backing logic)
-    // can grow ip->size past every block that's actually been
-    // allocated, on the theory that bmap() lazily allocates - and
-    // zeroes - a block the first time anything touches it, read or
-    // write, so a read of that grown region reads back zeros without
-    // this port needing to track holes as their own concept. That
-    // lazy allocation calls balloc(), which calls log_write() - the
-    // one part of readi() that can now actually modify the disk,
-    // where before (nothing could ever grow ip->size without already
-    // having allocated every block up to the new size) it never did.
-    // Chunked like filewrite()'s own loop, for the same reason: a
-    // single read of a large enough hole could otherwise need to
-    // allocate more blocks than one transaction is sized for.
+    // Fast path: readi_dense() (kernel/fs.c) walks the block map with
+    // non-allocating, batched peeks instead of bmap()'s allocating
+    // one-bread()-per-block walk, and succeeds unless it actually hits
+    // a hole - true for every ordinary file (mkfs's own image never
+    // creates one; only itruncto() growing ip->size without writing
+    // does, see its comment). On success it can skip the transaction
+    // machinery below entirely, since it's already proven nothing
+    // needed allocating. This is the common case, and matters: without
+    // it, *every* read - regardless of whether it could ever touch a
+    // hole - paid the small-chunked transaction loop's per-chunk
+    // log-commit cost below, measured turning a single ~700KB TTF font
+    // read into several real seconds of nothing but log commits (and,
+    // in an earlier version of this fix that checked density with a
+    // separate per-block pass first, several more seconds of nothing
+    // but redundant lock acquisitions - see readi_dense()'s own
+    // comment) for data that was never actually going to touch the
+    // log.
+    ilock(f->ip);
+    r = readi_dense(f->ip, addr, f->off, n);
+    if(r >= 0){
+      f->off += r;
+      iunlock(f->ip);
+      return r;
+    }
+    iunlock(f->ip);
+
+    // Slow path: this read's range includes (or might include) a hole
+    // left by itruncto() growing ip->size without writing, so bmap()
+    // may need its allocating branch after all - back to the original
+    // transaction-per-chunk loop, unchanged, for correctness. A
+    // transaction (matching filewrite()'s own, just below) is needed
+    // here even though a read "obviously" never used to touch the
+    // log: itruncto() (kernel/fs.c, ftruncate(2)'s backing logic) can
+    // grow ip->size past every block that's actually been allocated,
+    // on the theory that bmap() lazily allocates - and zeroes - a
+    // block the first time anything touches it, read or write, so a
+    // read of that grown region reads back zeros without this port
+    // needing to track holes as their own concept. That lazy
+    // allocation calls balloc(), which calls log_write() - the one
+    // part of readi() that can now actually modify the disk, where
+    // before (nothing could ever grow ip->size without already having
+    // allocated every block up to the new size) it never did. Chunked
+    // like filewrite()'s own loop, for the same reason: a single read
+    // of a large enough hole could otherwise need to allocate more
+    // blocks than one transaction is sized for.
     int max = ((MAXOPBLOCKS-1-1-2) / 2) * 512;
     int i = 0;
     while(i < n){

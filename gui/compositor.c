@@ -964,13 +964,41 @@ main(void)
 					old_wy = windows[drag_win].y;
 				}
 
-				for (; drained < MOUSE_DRAIN_MAX; drained++) {
-					struct mousepkt pkt;
-					int in_title;
-					struct epoll_event peek;
+				// Batch the actual read()s: kernel/mouse.c's mouseread()
+				// already happily returns as many whole packets as are
+				// queued in one call (up to whatever buffer size it's
+				// given), but this loop used to ask for exactly one
+				// packet (3 bytes) at a time and epoll_wait()-peek
+				// between every single one - fine under QEMU, but each
+				// of those is a real syscall, and under VirtualBox
+				// specifically the fixed per-syscall/per-lock-
+				// acquisition cost (see kernel/fs.c's readi_dense()
+				// comment for the same tax measured elsewhere) turned a
+				// single burst of a dozen-plus packets - one ordinary
+				// mouse wiggle - into a dozen-plus read()s *and* a
+				// dozen-plus epoll_wait()s, which is what actually made
+				// the cursor feel laggy. Reading a whole batch in one
+				// syscall and only peeking once per *batch* (not once
+				// per *packet*) cuts that by roughly MOUSE_DRAIN_MAX-to-
+				// one in the common case, with identical behavior -
+				// still bounded by MOUSE_DRAIN_MAX, still never blocks
+				// on an empty ring (the epoll_wait() peek below is what
+				// decides whether to read again at all).
+				while (drained < MOUSE_DRAIN_MAX) {
+					struct mousepkt pkts[MOUSE_DRAIN_MAX];
+					int want = MOUSE_DRAIN_MAX - drained;
+					int rr = read(mfd, pkts, (unsigned long)want * sizeof(pkts[0]));
+					int got, k;
 
-					if (read(mfd, &pkt, sizeof(pkt)) != (int)sizeof(pkt))
+					if (rr <= 0 || rr % (int)sizeof(pkts[0]) != 0)
 						break;
+					got = rr / (int)sizeof(pkts[0]);
+
+					for (k = 0; k < got; k++) {
+					struct mousepkt pkt = pkts[k];
+					int in_title;
+
+					drained++;
 					cursor_x += pkt.dx;
 					cursor_y -= pkt.dy;
 					if (cursor_x < 0) cursor_x = 0;
@@ -1095,9 +1123,17 @@ main(void)
 						try_send(w->fd, &pev, sizeof(pev));
 						sent_pressed = pressed;
 					}
+					} // for (k = 0; k < got; k++)
 
-					if (epoll_wait(epfd, &peek, 1, 0) != 1 || peek.data.fd != mfd)
-						break;
+					if (got < want)
+						break; // short read: ring is empty, nothing more to peek for
+
+					{
+						struct epoll_event peek;
+
+						if (epoll_wait(epfd, &peek, 1, 0) != 1 || peek.data.fd != mfd)
+							break;
+					}
 				}
 
 				// Final settled position/button-state, unconditionally (not

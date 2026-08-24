@@ -147,7 +147,7 @@ mousewrite(struct inode *ip, char *buf, int n)
 // must not hang boot - it should just end up with a mouse that never
 // reports anything, the same "missing hardware degrades gracefully"
 // approach kernel/vbe.c already takes for a VBE-less BIOS.
-static void
+static int
 mousewait(int type)
 {
   int timeout = 100000;
@@ -159,33 +159,43 @@ mousewait(int type)
     while(timeout-- > 0 && !(inb(MOUSE_KBSTATP) & 0x01))
       ;
   }
+  return timeout > 0;
 }
 
 void
 mouseinit(void)
 {
   uchar status;
+  int ok = 1;
 
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBSTATP, 0xA8);       // enable the auxiliary (mouse) device
 
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBSTATP, 0x20);       // "read controller command byte"
-  mousewait(1);
+  ok &= mousewait(1);
   status = inb(MOUSE_KBDATAP);
   status |= 0x02;              // bit1: enable IRQ12
   status &= ~(uchar)0x20;      // bit5: enable aux clock (0 = enabled)
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBSTATP, 0x60);       // "write controller command byte"
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBDATAP, status);
 
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBSTATP, 0xD4);       // next data byte goes to the aux device
-  mousewait(0);
+  ok &= mousewait(0);
   outb(MOUSE_KBDATAP, 0xF4);       // "enable data reporting"
-  mousewait(1);
-  inb(MOUSE_KBDATAP);                // discard the 0xFA ack
+  ok &= mousewait(1);
+  inb(MOUSE_KBDATAP);              // discard the 0xFA ack
+
+  // Every step above is bounded (mousewait()'s own comment), so a
+  // stuck/missing 8042 aux port degrades to "mouse never reports
+  // anything" rather than hanging boot - but silently: nothing else
+  // here ever surfaced that. Report it, at least, in case a future
+  // "mouse doesn't work" report on real hardware traces back to this.
+  if(!ok)
+    cprintf("mouseinit: 8042 handshake timed out - mouse may not work\n");
 
   initlock(&mouse.lock, "mouse");
   devsw[MOUSE].read = mouseread;

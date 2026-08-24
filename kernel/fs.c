@@ -447,6 +447,234 @@ bmap(struct inode *ip, uint bn)
   panic("bmap: out of range");
 }
 
+// Read-only counterpart to bmap(): returns the already-allocated block
+// address for bn, or 0 if that block (or an indirect/doubly-indirect
+// pointer block on the way to it) hasn't been allocated yet - i.e. bn
+// falls in a hole left by itruncto() growing ip->size without writing
+// (see that function's own comment). Never calls balloc()/log_write(),
+// so - unlike bmap() - this is safe to call outside a begin_op()/
+// end_op() transaction: only bread()s, which don't touch the log.
+static uint
+bmap_mapped(struct inode *ip, uint bn)
+{
+  uint addr, iaddr, *a;
+  struct buf *bp;
+
+  if(bn < NDIRECT)
+    return ip->addrs[bn];
+  bn -= NDIRECT;
+
+  if(bn < NINDIRECT){
+    if((addr = ip->addrs[NDIRECT]) == 0)
+      return 0;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    addr = a[bn];
+    brelse(bp);
+    return addr;
+  }
+  bn -= NINDIRECT;
+
+  if(bn < NDINDIRECT){
+    uint idx1 = bn / NINDIRECT;
+    uint idx2 = bn % NINDIRECT;
+
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      return 0;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    iaddr = a[idx1];
+    brelse(bp);
+    if(iaddr == 0)
+      return 0;
+
+    bp = bread(ip->dev, iaddr);
+    a = (uint*)bp->data;
+    addr = a[idx2];
+    brelse(bp);
+    return addr;
+  }
+
+  panic("bmap_mapped: out of range");
+}
+
+// Batched counterpart to calling bmap_mapped() once per block: extends
+// from logical block bn as far as maxblocks blocks that are both
+// already-allocated and physically contiguous with the first, but
+// reuses each indirect/doubly-indirect pointer block's buffer across
+// every logical block that shares it - one bread()/brelse() pair (and
+// so one spinlock acquire()/release() pair) per *pointer* block
+// actually touched, not one per data block. That distinction is what
+// actually matters: every acquire() runs mycpu() (kernel/proc.c),
+// which reads the Local APIC ID via an MMIO access - cheap on real
+// hardware/QEMU, but measured to be expensive enough under VirtualBox
+// specifically that calling bmap_mapped() once per block turned a
+// single ~700KB file read (see readi_dense()'s own comment for the
+// concrete numbers) into several real seconds of nothing but lock
+// acquisitions for data that was always going to be a cache hit.
+// Returns the run length (0 if bn itself is a hole) and, if nonzero,
+// the physical address of the first block via *first_addr. Never
+// calls balloc()/log_write() - safe outside any transaction.
+static uint
+contig_dense_run(struct inode *ip, uint bn, uint maxblocks, uint *first_addr)
+{
+  uint count = 0, addr;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
+
+  if(maxblocks == 0)
+    return 0;
+
+  // Direct blocks: already resident in ip->addrs[], no bread needed.
+  while(count < maxblocks && bn + count < NDIRECT){
+    addr = ip->addrs[bn + count];
+    if(addr == 0)
+      return count;
+    if(count == 0)
+      *first_addr = addr;
+    else if(addr != *first_addr + count)
+      return count;
+    count++;
+  }
+  if(count == maxblocks || bn + count >= NDIRECT + NINDIRECT + NDINDIRECT)
+    return count;
+
+  // Single-indirect range: one bread() covers every block from
+  // NDIRECT up to NDIRECT+NINDIRECT-1.
+  if(bn + count < NDIRECT + NINDIRECT){
+    if(ip->addrs[NDIRECT] == 0)
+      return count;
+    bp = bread(ip->dev, ip->addrs[NDIRECT]);
+    a = (uint*)bp->data;
+    while(count < maxblocks && bn + count < NDIRECT + NINDIRECT){
+      addr = a[bn + count - NDIRECT];
+      if(addr == 0){
+        brelse(bp);
+        return count;
+      }
+      if(count == 0)
+        *first_addr = addr;
+      else if(addr != *first_addr + count){
+        brelse(bp);
+        return count;
+      }
+      count++;
+    }
+    brelse(bp);
+    if(count == maxblocks)
+      return count;
+  }
+
+  // Doubly-indirect range: one bread() for the doubly-indirect block
+  // itself, then one bread() per singly-indirect leaf block actually
+  // touched (each covering up to NINDIRECT data blocks) - not one per
+  // data block.
+  if(ip->addrs[NDIRECT+1] == 0)
+    return count;
+  bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+  a = (uint*)bp->data;
+  while(count < maxblocks){
+    uint off2 = bn + count - NDIRECT - NINDIRECT;
+    uint idx1 = off2 / NINDIRECT;
+    uint iaddr;
+
+    if(idx1 >= NINDIRECT)
+      break;
+    iaddr = a[idx1];
+    if(iaddr == 0)
+      break;
+    bp2 = bread(ip->dev, iaddr);
+    a2 = (uint*)bp2->data;
+    while(count < maxblocks){
+      uint o2 = bn + count - NDIRECT - NINDIRECT;
+
+      if(o2 / NINDIRECT != idx1)
+        break;
+      addr = a2[o2 % NINDIRECT];
+      if(addr == 0){
+        brelse(bp2);
+        brelse(bp);
+        return count;
+      }
+      if(count == 0)
+        *first_addr = addr;
+      else if(addr != *first_addr + count){
+        brelse(bp2);
+        brelse(bp);
+        return count;
+      }
+      count++;
+    }
+    brelse(bp2);
+  }
+  brelse(bp);
+  return count;
+}
+
+// Fast counterpart to readi(), for fileread()'s dense-file case only:
+// structured exactly like readi()'s own bulk-vs-single-block split,
+// but walks the block map with contig_dense_run()/bmap_mapped()
+// (batched, non-allocating) instead of bmap() (which allocates on a
+// hole and therefore needs a transaction around it). Never touches
+// the log, so it's safe to call outside any begin_op()/end_op() pair.
+// Returns -1 the moment it would hit a hole - whatever's already been
+// written into dst is fine to leave as-is when that happens, since the
+// caller (fileread()) discards this attempt entirely and retries the
+// whole read via the original transactional path rather than trying
+// to resume a partial dense read.
+int
+readi_dense(struct inode *ip, char *dst, uint off, uint n)
+{
+  uint tot, m, addr;
+  struct buf *bp;
+
+  // A device special file (T_DEV - console, mouse, framebuffer) has no
+  // real block-mapped data at all, and ialloc() leaves every fresh
+  // inode's on-disk size at 0 (memset to zero, never touched again for
+  // a device - see ialloc()'s own memset()). Falling through to the
+  // off/size clamping below would therefore clamp n to 0 for *every*
+  // device read (0 + n > size(0) is always true), silently "succeeding"
+  // with a 0-byte, EOF-looking read instead of ever reaching the real
+  // driver - which for the mouse device in particular means real,
+  // already-decoded PS/2 packets (kernel/mouse.c) sit in its ring
+  // buffer forever, unconsumed, and the cursor never moves. Matches
+  // readi()'s own T_DEV branch (which this whole function otherwise
+  // parallels) - checked first, before any of that arithmetic.
+  if(ip->type == T_DEV){
+    if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].read)
+      return -1;
+    return devsw[ip->major].read(ip, dst, n);
+  }
+
+  if(off > ip->size || off + n < off)
+    return -1;
+  if(off + n > ip->size)
+    n = ip->size - off;
+
+  for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    if(off % BSIZE == 0 && n - tot >= BSIZE){
+      uint first_addr = 0, nb = contig_dense_run(ip, off / BSIZE, (n - tot) / BSIZE, &first_addr);
+
+      if(nb > 0 && bio_range_clean(ip->dev, first_addr, nb)){
+        ide_bulk_read(first_addr, dst, nb);
+        m = nb * BSIZE;
+        continue;
+      }
+      if(nb == 0)
+        return -1;
+      // nb > 0 but dirty: fall through to the single-block path below
+      // for just this one block, same as readi()'s own such fallback.
+    }
+    if((addr = bmap_mapped(ip, off / BSIZE)) == 0)
+      return -1;
+    bp = bread(ip->dev, addr);
+    m = min(n - tot, BSIZE - off%BSIZE);
+    memmove(dst, bp->data + off%BSIZE, m);
+    brelse(bp);
+  }
+  return tot;
+}
+
 // Free every data block of ip whose logical block number is >= startbn
 // (itrunc(ip)'s startbn==0 case discards everything; sys_ftruncate's
 // shrink case passes ceil(newsize/BSIZE) to keep the blocks before the
